@@ -1156,6 +1156,7 @@ subdir('src/nspawn')
 subdir('src/resolve')
 subdir('src/timedate')
 subdir('src/timesync')
+subdir('src/thunderbolt')
 subdir('src/vconsole')
 subdir('src/sulogin-shell')
 subdir('src/boot/efi')
@@ -2213,6 +2214,14 @@ exe = executable('networkctl',
                  install_dir : rootbindir)
 public_programs += [exe]
 
+exe = executable('tbtctl',
+                 tbtctl_sources,
+                 include_directories : includes,
+                 link_with : [libudev_core],
+                 install_rpath : rootlibexecdir,
+                 install : true,
+                 install_dir : rootbindir)
+public_programs += [exe]
 ############################################################
 
 foreach tuple : tests
