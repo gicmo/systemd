@@ -479,7 +479,23 @@ static int write_security(int fd, Security security) {
         return loop_write(fd, buf, 1, false);
 }
 
-static int device_read_uuid_at (int dirfd, char **uuid_out) {
+static int write_security_at (int dirfd, Security security) {
+        int fd, r;
+
+        fd = openat(dirfd, "authorized", O_NOFOLLOW|O_CLOEXEC|O_WRONLY);
+        if (fd < 0)
+                return -errno;
+
+        r = write_security(fd, security);
+        if (r < 0) {
+                (void) close(fd);
+                return r;
+        }
+
+        return close_nointr(fd);
+}
+
+static int device_read_uuid_at(int dirfd, char **uuid_out) {
         char *uuid;
         int fd;
         int r;
@@ -503,7 +519,6 @@ static int device_authorize(struct udev_device *device, bool genkey, bool force)
         _cleanup_free_ char *uuid = NULL;
         const char *syspath;
         Security security;
-        int fd;
         int r;
 
         /* the unlikely event of invalid security will
@@ -517,14 +532,9 @@ static int device_authorize(struct udev_device *device, bool genkey, bool force)
         if (!devdir)
                 return -errno;
 
-        fd = openat(dirfd(devdir), "unique_id", O_NOFOLLOW|O_CLOEXEC|O_RDONLY);
-        if (fd < 0)
-                return -errno;
-
-        r = read_one_line_consume_fd(fd, &uuid);
-        if (r < 0) {
+        r = device_read_uuid_at(dirfd(devdir), &uuid);
+        if (r < 0)
                 return r;
-        }
 
         if (security == SECURITY_SECURE) {
                 _cleanup_close_ int key_from = -1;
@@ -560,17 +570,7 @@ static int device_authorize(struct udev_device *device, bool genkey, bool force)
                         security = SECURITY_USER;
         }
 
-        fd = openat(dirfd(devdir), "authorized", O_NOFOLLOW|O_CLOEXEC|O_WRONLY);
-        if (fd < 0)
-                return -errno;
-
-        r = write_security(fd, security);
-        if (r < 0) {
-                (void) close(fd);
-                return r;
-        }
-
-        return close_nointr(fd);
+        return write_security_at(dirfd(devdir), security);
 }
 
 static int authorize_device(struct udev *udev, int argc, char *argv[]) {
