@@ -540,17 +540,20 @@ static int store_get_authorization(TbtStore *store, const char *uuid, char **ret
         if (startswith(p, "/sys/firmware/efi/efivars")) {
                 r = store_efivars_get_auth(uuid, ret);
         } else if (startswith(p, store->path)) {
-                r = ENOSYS;
+                r = -ENOSYS;
         }
 
         return r;
 }
 
-static int store_efivars_put_auth(const char *uuid,
+static int store_efivars_put_auth(TbtStore *store,
+                                  const char *uuid,
                                   Security level,
                                   const char *key) {
+        _cleanup_free_ char *target = NULL;
         char buf[FORMAT_SECURITY_MAX];
         sd_id128_t id;
+        char *path;
         int r;
 
         assert(level > -1);
@@ -566,11 +569,27 @@ static int store_efivars_put_auth(const char *uuid,
                 r = efi_set_variable(id, "Thunderbolt", buf, 1);
         }
 
-        return r;
+        if (r < 0)
+                return r;
+
+        if (asprintf(&target,
+                     "/sys/firmware/efi/efivars/Thunderbolt"
+                     "-%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                     SD_ID128_FORMAT_VAL(id)) < 0)
+                 return -ENOMEM;
+
+        path = strjoina(store->path, "/authorization/", uuid);
+
+        r = mkdir_parents(path, 0755);
+        if (r < 0)
+                return r;
+
+        return symlink_idempotent(target, path);
 }
 
 
-static int store_fsdb_put_auth(const char *uuid,
+static int store_fsdb_put_auth(TbtStore *store,
+                               const char *uuid,
                                Security level,
                                const char *key) {
 
@@ -595,11 +614,11 @@ static int store_put_device(TbtStore *store,
 
         switch (store->keystore) {
         case TBT_KEYSTORE_FSDB:
-                r = store_fsdb_put_auth(uuid, level, key);
+                r = store_fsdb_put_auth(store, uuid, level, key);
                 break;
 
         case TBT_KEYSTORE_EFIVARS:
-                r = store_efivars_put_auth(uuid, level, key);
+                r = store_efivars_put_auth(store, uuid, level, key);
                 break;
         }
 
@@ -688,7 +707,7 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
         int auth_store;
         int r;
 
-        if (argc < 1) {
+        if (argc < 2) {
                 fprintf(stderr, "%s: need sysfs path\n",
                         program_invocation_short_name);
                 return EXIT_FAILURE;
@@ -735,7 +754,6 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        /* check auth_want <= auth_ctrl */
         if (auth_want > auth_ctrl) {
                 log_error("Requested security level not supported by domain controller");
                 return EXIT_FAILURE;
@@ -788,10 +806,91 @@ static const struct CtlCmd cmd_authorize = {
         .root = true,
 };
 
+static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
+        _cleanup_udev_device_unref_ struct udev_device *device = NULL;
+        _cleanup_closedir_ DIR *devdir = NULL;
+        _cleanup_store_free_ TbtStore *store = NULL;
+        _cleanup_string_free_erase_ char *key = NULL;
+        _cleanup_free_ char *uuid = NULL;
+        const char *syspath;
+        int auth_want;
+        int auth_ctrl;
+        int auth_store;
+        int r;
+
+        if (argc < 2) {
+                fprintf(stderr, "%s: need sysfs path\n",
+                        program_invocation_short_name);
+                return EXIT_FAILURE;
+        }
+
+        r = tbt_store_new(&store);
+        if (r < 0) {
+                log_error_errno(r, "Couldn't open store: %m");
+                return EXIT_FAILURE;
+        }
+
+        syspath = argv[1];
+        device = udev_device_new_from_syspath(udev, syspath);
+
+        if (device == NULL) {
+                log_error("Couldn't open device at: %s", syspath);
+                return EXIT_FAILURE;
+        }
+
+        devdir = opendir(syspath);
+        if (!devdir) {
+                log_error_errno(errno, "Could not open device: %m");
+                return EXIT_FAILURE;
+        }
+
+        r = device_read_uuid_at(dirfd(devdir), &uuid);
+        if (r < 0) {
+                log_error_errno(errno, "Could not read device unique id: %m");
+                return EXIT_FAILURE;
+        }
+
+        auth_ctrl = security_for_device(device);
+        if (auth_ctrl < 0) {
+                log_error_errno(auth_ctrl, "Could not determine security level: %m");
+                return EXIT_FAILURE;
+        }
+
+        auth_store = store_get_authorization(store, uuid, &key);
+        if (auth_store == -ENOENT || auth_store == 0) {
+                /* Unknown or ignored device */
+                return EXIT_SUCCESS;
+        } else if (auth_store < 0) {
+                log_error_errno(auth_store, "Failed to read authorization from store: %m");
+                return EXIT_FAILURE;
+        }
+
+        auth_want = MIN(auth_ctrl, auth_store);
+
+        r = device_authorize_at(dirfd(devdir), auth_want, key);
+        if (r < 0) {
+                log_error_errno(r, "Failed to authorize device: %m");
+                return EXIT_FAILURE;
+        }
+
+        return EXIT_SUCCESS;
+}
+
+static const struct CtlCmd cmd_udev = {
+        .name = "udev",
+        .func = authorize_udev,
+        .desc = "internal command for udev rules",
+        .root = true,
+};
+
+
 static const struct CtlCmd *ctrl_cmds[] = {
         &cmd_list,
-        &cmd_authorize
+        &cmd_authorize,
+
+        &cmd_udev
 };
+
 
 
 static void help(void) {
