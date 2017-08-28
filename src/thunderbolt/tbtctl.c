@@ -80,22 +80,6 @@ static int read_one_line_consume_fd(int fd, char **line_out) {
 
 /*  */
 
-typedef enum Policy {
-        POLICY_IGNORE,
-        POLICY_AUTO,
-        _POLICY_MAX,
-        POLICY_UNKNOWN = -1,
-} Policy;
-
-static const char* const policy_table[_POLICY_MAX] = {
-        [POLICY_IGNORE] = "ignore",
-        [POLICY_AUTO]   = "auto",
-};
-
-DEFINE_PRIVATE_STRING_TABLE_LOOKUP(policy, Policy);
-static DEFINE_CONFIG_PARSE_ENUM(config_parse_policy, policy, Policy, "Failed to parse policy setting");
-
-
 typedef enum Security {
         SECURITY_NONE    = 0,
         SECURITY_USER    = 1, /* corresponds to sysfs 'authorized value' ("1") */
@@ -155,8 +139,6 @@ typedef struct {
 
         char *name;
         char *vendor;
-
-        Policy policy;
 
 } TbtDevice;
 
@@ -220,7 +202,6 @@ static int tbt_store_parse_device(TbtDevice *device) {
         const ConfigTableItem items[] = {
                 { "device", "name",         config_parse_string,           0, &device->name       },
                 { "device", "vendor-name",  config_parse_string,           0, &device->vendor     },
-                { "user",   "policy",       config_parse_policy,           0, &device->policy     },
                 {}
         };
         _cleanup_fclose_ FILE *f = NULL;
@@ -396,15 +377,7 @@ static void device_print(struct udev_device *device)
         printf("  %s in store:   %s\n", special_glyph(TREE_RIGHT), store);
 
         if (tbtdev) {
-                const char *policy_str;
                 const char *key_str;
-
-                if (tbtdev->policy < 0)
-                        policy_str = "unknown";
-                else
-                        policy_str = policy_to_string(tbtdev->policy);
-
-                printf("    %s policy:   %s\n", special_glyph(TREE_BRANCH), policy_str);
 
                 r = tbt_store_have_key(uuid);
                 if (r > -1)
