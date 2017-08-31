@@ -80,14 +80,14 @@ static int read_one_line_consume_fd(int fd, char **line_out) {
 
 /*  */
 
-typedef enum Security {
+typedef enum SecurityLevel {
         SECURITY_NONE    = 0,
         SECURITY_USER    = 1, /* corresponds to sysfs 'authorized value' ("1") */
         SECURITY_SECURE  = 2, /* corresponds to sysfs 'authorized value' ("2") */
         SECURITY_DPONLY  = 3,
         _SECURITY_MAX,
         _SECURITY_INVALID = -1,
-} Security;
+} SecurityLevel;
 
 /* the strings here correspond to the values reported
  * in sysfs ('security' attribute) for the domain  */
@@ -97,9 +97,9 @@ static const char* const security_table[_SECURITY_MAX] = {
         [SECURITY_SECURE]  = "secure",
         [SECURITY_DPONLY]  = "dponly",
 };
-DEFINE_PRIVATE_STRING_TABLE_LOOKUP(security, Security);
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP(security, SecurityLevel);
 
-static Security security_for_device(struct udev_device *device) {
+static SecurityLevel security_for_device(struct udev_device *device) {
         struct udev_device *parent;
         const char *security;
         bool found;
@@ -322,7 +322,7 @@ static void device_print(struct udev_device *device)
         const char *auth_level;
         const char *auth_sym, *auth_con, *auth_coff;
         const char *store;
-        Security security;
+        SecurityLevel security;
 
         uuid = udev_device_get_sysattr_value(device, "unique_id");
         name = udev_device_get_sysattr_value(device, "device_name");
@@ -521,7 +521,7 @@ static int store_get_authorization(TbtStore *store, const char *uuid, char **ret
 
 static int store_efivars_put_auth(TbtStore *store,
                                   const char *uuid,
-                                  Security level,
+                                  SecurityLevel level,
                                   const char *key) {
         _cleanup_free_ char *target = NULL;
         char buf[FORMAT_SECURITY_MAX];
@@ -563,7 +563,7 @@ static int store_efivars_put_auth(TbtStore *store,
 
 static int store_fsdb_put_auth(TbtStore *store,
                                const char *uuid,
-                               Security level,
+                               SecurityLevel level,
                                const char *key) {
 
         return -ENOTSUP;
@@ -572,7 +572,7 @@ static int store_fsdb_put_auth(TbtStore *store,
 
 static int store_put_device(TbtStore *store,
                             struct udev_device *device,
-                            Security level,
+                            SecurityLevel level,
                             const char *key) {
         _cleanup_fclose_ FILE *f = NULL;
         const char *uuid;
@@ -617,7 +617,7 @@ static int store_put_device(TbtStore *store,
         return fflush_and_check(f);
 }
 
-static int device_authorize_at(int dirfd, Security level, const char *key) {
+static int device_authorize_at(int dirfd, SecurityLevel level, const char *key) {
         char buf[FORMAT_SECURITY_MAX];
         _cleanup_close_ int fd = -1;
         ssize_t l;
