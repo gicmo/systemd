@@ -99,7 +99,7 @@ static const char* const security_table[_SECURITY_MAX] = {
 };
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP(security, SecurityLevel);
 
-static SecurityLevel security_for_device(struct udev_device *device) {
+static SecurityLevel device_get_security_level(struct udev_device *device) {
         struct udev_device *parent;
         const char *security;
         bool found;
@@ -360,7 +360,7 @@ static void device_print(struct udev_device *device)
 
         printf("  %s security:   ", special_glyph(TREE_BRANCH));
 
-        security = security_for_device(device);
+        security = device_get_security_level(device);
         if (security == _SECURITY_INVALID)
                 printf("unknown\n");
         else
@@ -721,7 +721,7 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        auth_ctrl = security_for_device(device);
+        auth_ctrl = device_get_security_level(device);
         if (auth_ctrl < 0) {
                 log_error_errno(auth_ctrl, "Could not determine security level: %m");
                 return EXIT_FAILURE;
@@ -823,7 +823,7 @@ static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        auth_ctrl = security_for_device(device);
+        auth_ctrl = device_get_security_level(device);
         if (auth_ctrl < 0) {
                 log_error_errno(auth_ctrl, "Could not determine security level: %m");
                 return EXIT_FAILURE;
