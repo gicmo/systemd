@@ -714,10 +714,6 @@ static int device_get_authorized(struct udev_device *device, unsigned *authorize
         return safe_atou(str, authorized);
 }
 
-static inline const char *yesno(bool b) {
-        return b ? "yes" : "no";
-}
-
 static void device_print(TbStore *store, TbDevice *device)
 {
         unsigned authorized;
@@ -774,7 +770,7 @@ static void device_print(TbStore *store, TbDevice *device)
         }
 
         in_store = tb_store_have_device(store, device->uuid);
-        printf("  %s in store:   %s\n", special_glyph(TREE_RIGHT), yesno(in_store));
+        printf("  %s in store:   %s\n", special_glyph(TREE_RIGHT), yes_no(in_store));
 
         if (!in_store)
                 goto out;
@@ -788,7 +784,7 @@ static void device_print(TbStore *store, TbDevice *device)
                 policy_str = "authorize";
 
         printf("     %s policy:  %s\n", special_glyph(TREE_BRANCH), policy_str);
-        printf("     %s key:     %s\n", special_glyph(TREE_RIGHT), yesno(!!auth.key));
+        printf("     %s key:     %s\n", special_glyph(TREE_RIGHT), yes_no(!!auth.key));
 
  out:
         printf("\n");
