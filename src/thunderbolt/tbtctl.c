@@ -662,7 +662,7 @@ static int tb_store_list_ids(TbStore *store, char ***ret) {
 
 static int tb_store_load_missing(TbStore *store, Hashmap *devices) {
         char **ids = NULL;
-        unsigned i, n;
+        char **i;
         TbDevice *device;
 
         int r;
@@ -670,9 +670,8 @@ static int tb_store_load_missing(TbStore *store, Hashmap *devices) {
         if (r < 0)
                 return r;
 
-        n = strv_length(ids);
-        for (i = 0; i < n; i ++) {
-                const char *id = ids[i];
+        STRV_FOREACH(i, ids) {
+                const char *id = *i;
                 if (hashmap_contains(devices, id))
                         continue;
 
