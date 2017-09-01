@@ -24,15 +24,18 @@
 #include "libudev.h"
 
 #include "conf-parser.h"
+#include "dirent-util.h"
 #include "efivars.h"
 #include "fd-util.h"
 #include "fs-util.h"
 #include "fileio.h"
+#include "hash-funcs.h"
 #include "io-util.h"
 #include "locale-util.h"
 #include "mkdir.h"
 #include "parse-util.h"
 #include "random-util.h"
+#include "set.h"
 #include "stdio-util.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -135,6 +138,57 @@ static void tb_device_free(TbDevice **device) {
 
 #define _cleanup_tb_device_free_ _cleanup_(tb_device_free)
 
+// -1, a < b; 0, a == b; 1, a > b
+static int tb_device_compare(const void *ia, const void *ib) {
+        const TbDevice *a = ia;
+        const TbDevice *b = ib;
+        const char *pa, *pb;
+        size_t la, lb;
+
+        assert(a);
+        assert(b);
+
+        if (!a->udev && !b->udev)
+                return strcmp_ptr(a->name, b->name);
+        else if (!b->udev)
+                return -1;
+        else if (!a->udev)
+                return 1;
+
+        /* both have udev devices */
+        assert(a->udev);
+        assert(b->udev);
+
+        pa = udev_device_get_syspath(a->udev);
+        pb = udev_device_get_syspath(b->udev);
+
+        la = strlen_ptr(pa);
+        lb = strlen_ptr(pb);
+
+        if (la != lb)
+                return la - lb;
+
+        /* sysfs path is same length, i.e. siblings */
+        return strcmp_ptr(pa, pb);
+}
+
+static int tb_device_ptr_compare (const void *pa, const void *pb) {
+        const TbDevice **a = (const TbDevice **) pa;
+        const TbDevice **b =  (const TbDevice **) pb;
+
+        return tb_device_compare(*a, *b);
+}
+
+static void tb_device_hash_func(const void *p, struct siphash *state) {
+        const TbDevice *d = p;
+        siphash24_compress(d->uuid, strlen(d->uuid) + 1, state);
+}
+
+const struct hash_ops tb_device_hash_ops = {
+        .hash = tb_device_hash_func,
+        .compare = tb_device_compare,
+
+};
 
 static SecurityLevel device_get_security_level(struct udev_device *device) {
         struct udev_device *parent;
@@ -585,6 +639,54 @@ static bool tb_store_have_device(TbStore *store, const char *uuid) {
         return stat(p, &st) == 0;
 }
 
+static int tb_store_list_ids(TbStore *store, char ***ret) {
+        _cleanup_closedir_ DIR *d = NULL;
+        struct dirent *de;
+        char *p;
+
+        assert(store);
+        assert(ret);
+        *ret = NULL;
+
+        p = strjoina(store->path, "/devices/");
+        d = opendir(p);
+        if (!d)
+                return errno == ENOENT ? true : -errno;
+
+        FOREACH_DIRENT(de, d, return -errno) {
+                strv_extend(ret, de->d_name);
+        }
+
+        return 0;
+}
+
+static int tb_store_load_missing(TbStore *store, Hashmap *devices) {
+        char **ids = NULL;
+        unsigned i, n;
+        TbDevice *device;
+
+        int r;
+        r = tb_store_list_ids(store, &ids);
+        if (r < 0)
+                return r;
+
+        n = strv_length(ids);
+        for (i = 0; i < n; i ++) {
+                const char *id = ids[i];
+                if (hashmap_contains(devices, id))
+                        continue;
+
+                r = tb_store_device_load(id, &device);
+                if (r < 0) {
+                        log_warning_errno(r, "Could not load device %s from DB: %m", id);
+                        continue;
+                }
+
+                hashmap_put(devices, device->uuid, device);
+        }
+
+        return 0;
+}
 
 static int tb_generate_key_string(char **key_out) {
         uint8_t rnddata[KEY_BYTES];
@@ -603,9 +705,12 @@ static int tb_generate_key_string(char **key_out) {
         return 0;
 }
 
-static int device_get_authorized(struct udev_device *device, unsigned *authorized)
-{
+static int device_get_authorized(struct udev_device *device, unsigned *authorized) {
         const char *str;
+
+        if (device == NULL)
+                return -ENODEV;
+
         str = udev_device_get_sysattr_value(device, "authorized");
         return safe_atou(str, authorized);
 }
@@ -626,24 +731,28 @@ static void device_print(TbStore *store, TbDevice *device)
         const char *policy_str;
 
         r = device_get_authorized(device->udev, &authorized);
-        if (r < 0) {
+        if (r == -ENODEV) {
+                auth_level = "offline";
+                auth_con = ansi_highlight_blue();;
+                auth_sym = special_glyph(BLACK_CIRCLE);
+        } else if (r < 0) {
                 auth_level = "unknown (error)";
                 auth_con = ansi_highlight_red();
                 auth_sym = special_glyph(BLACK_CIRCLE);
         } else if (authorized == AUTHORIZED_MISSING) {
-                auth_level = "no";
+                auth_level = "unauthorized";
                 auth_con = ansi_highlight_yellow();
                 auth_sym = special_glyph(BLACK_CIRCLE);
         } else if (authorized == AUTHORIZED_USER) {
-                auth_level = "yes";
+                auth_level = "authorized (user)";
                 auth_con = ansi_highlight_green();
                 auth_sym = special_glyph(BLACK_CIRCLE);
         } else if (authorized == AUTHORIZED_KEY) {
-                auth_level = "yes (key)";
+                auth_level = "authorized (key)";
                 auth_con = ansi_highlight_green();
                 auth_sym = special_glyph(BLACK_CIRCLE);
         } else {
-                auth_level = "unknown";
+                auth_level = "unknown authorization";
                 auth_con = ansi_highlight_red();
                 auth_sym = special_glyph(BLACK_CIRCLE);
         }
@@ -653,15 +762,17 @@ static void device_print(TbStore *store, TbDevice *device)
         printf("%s%s%s %s\n", auth_con, auth_sym, auth_coff, device->name);
         printf("  %s vendor:     %s\n", special_glyph(TREE_BRANCH), device->vendor);
         printf("  %s uuid:       %s\n", special_glyph(TREE_BRANCH), device->uuid);
-        printf("  %s authorized: %s\n", special_glyph(TREE_BRANCH), auth_level);
+        printf("  %s status:     %s\n", special_glyph(TREE_BRANCH), auth_level);
 
-        printf("  %s security:   ", special_glyph(TREE_BRANCH));
+        if (authorized > 0) {
+                printf("  %s security:   ", special_glyph(TREE_BRANCH));
 
-        security = device_get_security_level(device->udev);
-        if (security == _SECURITY_INVALID)
-                printf("unknown\n");
-        else
-                printf("%s\n", security_to_string(security));
+                security = device_get_security_level(device->udev);
+                if (security == _SECURITY_INVALID)
+                        printf("unknown\n");
+                else
+                        printf("%s\n", security_to_string(security));
+        }
 
         in_store = tb_store_have_device(store, device->uuid);
         printf("  %s in store:   %s\n", special_glyph(TREE_RIGHT), yesno(in_store));
@@ -685,14 +796,26 @@ static void device_print(TbStore *store, TbDevice *device)
 }
 
 static int list_devices(struct udev *udev, int argc, char *argv[]) {
-        _cleanup_udev_enumerate_unref_ struct udev_enumerate *enumerate;
+        _cleanup_udev_enumerate_unref_ struct udev_enumerate *enumerate = NULL;
+        _cleanup_hashmap_free_ Hashmap *devices = NULL;
         _cleanup_tb_store_free_ TbStore *store = NULL;
         struct udev_list_entry *list_entry = NULL, *first = NULL;
+        _cleanup_free_ TbDevice **dl = NULL;
+        TbDevice *device = NULL;
+        TbDevice **di;
+        Iterator iter;
+        unsigned i, n;
         int r;
 
         r = tb_store_new(&store);
         if (r < 0) {
                 log_error_errno(r, "Couldn't open store: %m");
+                return EXIT_FAILURE;
+        }
+
+        devices = hashmap_new(&string_hash_ops);
+        if (devices == NULL) {
+                log_oom();
                 return EXIT_FAILURE;
         }
 
@@ -703,6 +826,7 @@ static int list_devices(struct udev *udev, int argc, char *argv[]) {
         r = udev_enumerate_add_match_subsystem(enumerate, "thunderbolt");
         if (r < 0)
                 return EXIT_FAILURE;
+
         r = udev_enumerate_add_match_sysattr(enumerate, "unique_id", NULL);
         if (r < 0)
                 return EXIT_FAILURE;
@@ -713,7 +837,6 @@ static int list_devices(struct udev *udev, int argc, char *argv[]) {
 
         first = udev_enumerate_get_list_entry(enumerate);
         udev_list_entry_foreach(list_entry, first) {
-                _cleanup_tb_device_free_ TbDevice *device = NULL;
                 const char *name;
 
                 name = udev_list_entry_get_name(list_entry);
@@ -721,7 +844,27 @@ static int list_devices(struct udev *udev, int argc, char *argv[]) {
                 if (r < 0)
                         continue;
 
+                hashmap_put(devices, device->uuid, device);
+        }
+
+        if (true) {
+                r = tb_store_load_missing(store, devices);
+                if (r < 0)
+                        log_error_errno(r, "Could not load devices from DB: %m");
+        }
+
+        n = hashmap_size(devices);
+        dl = di = new(TbDevice *, n);
+
+        HASHMAP_FOREACH(device, devices, iter)
+                *di++ = device;
+
+        qsort(dl, n, sizeof(TbDevice *), tb_device_ptr_compare);
+
+        for (i = 0; i < n; i++) {
+                device = dl[i];
                 device_print(store, device);
+                tb_device_free(&device);
         }
 
         return EXIT_SUCCESS;
