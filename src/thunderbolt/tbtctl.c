@@ -18,12 +18,15 @@
 ***/
 
 #include <getopt.h>
+#include <linux/fs.h>
 #include <locale.h>
+#include <sys/ioctl.h>
 #include <sys/sendfile.h>
 
 #include "libudev.h"
 
 #include "conf-parser.h"
+#include "chattr-util.h"
 #include "dirent-util.h"
 #include "efivars.h"
 #include "fd-util.h"
@@ -401,8 +404,8 @@ static int tb_store_new(TbStore **ret) {
 
 static int tb_store_parse_device(TbDevice *device) {
         const ConfigTableItem items[] = {
-                { "device", "name",         config_parse_string,           0, &device->name       },
-                { "device", "vendor-name",  config_parse_string,           0, &device->vendor     },
+                { "device", "name",    config_parse_string,  0, &device->name    },
+                { "device", "vendor",  config_parse_string,  0, &device->vendor  },
                 {}
         };
         _cleanup_fclose_ FILE *f = NULL;
@@ -497,7 +500,7 @@ static int store_efivars_get_auth(const char *uuid, Authorization *ret) {
                 return 0;
         }
 
-        /* should not happen, because we write the it */
+        /* should not happen, because only we write it */
         return -EIO;
 }
 
@@ -683,6 +686,60 @@ static int tb_store_load_missing(TbStore *store, Hashmap *devices) {
 
                 hashmap_put(devices, device->uuid, device);
         }
+
+        return 0;
+}
+
+static int tb_store_remove_authorization(TbStore *store, const char *uuid) {
+        _cleanup_free_ char *p = NULL;
+        struct stat st;
+        char *path;
+        int r;
+
+        if (in_initrd())
+                return -EPERM;
+
+        path = strjoina(store->path, "/authorization/", uuid);
+
+        r = lstat(path, &st);
+        if (r < 0)
+                return -errno;
+
+        if (S_ISREG(st.st_mode)) {
+                r = unlink(path);
+                return r < 0 ? -errno : 0;
+        }
+
+        r = readlink_malloc(path, &p);
+        if (r < 0)
+                return r;
+
+        if (startswith(p, "/sys/firmware/efi/efivars")) {
+                r = chattr_path(p, 0, FS_IMMUTABLE_FL);
+                if (r < 0)
+                        return r;
+        }
+
+        r = unlink(p);
+        if (r < 0) {
+                return -errno;
+        }
+
+        r = unlink(path);
+        return r < 0 ? -errno : 0;
+}
+
+static int tb_store_remove_device(TbStore *store, const char *uuid) {
+        char *p;
+        int r;
+
+        if (in_initrd())
+                return -EPERM;
+
+        p = strjoina(store->path, "/devices/", uuid);
+        r = unlink(p);
+        if (r < 0)
+                return -errno;
 
         return 0;
 }
@@ -1027,9 +1084,51 @@ static const struct CtlCmd cmd_udev = {
 };
 
 
+static int forget_device(struct udev *udev, int argc, char *argv[]) {
+        _cleanup_tb_store_free_ TbStore *store = NULL;
+        const char *uuid;
+        int r;
+
+        if (argc < 2) {
+                fprintf(stderr, "%s: need device uuid\n",
+                        program_invocation_short_name);
+                return EXIT_FAILURE;
+        }
+
+        uuid = argv[1];
+
+        r = tb_store_new(&store);
+        if (r < 0) {
+                log_error_errno(r, "Couldn't open store: %m");
+                return EXIT_FAILURE;
+        }
+
+        r = tb_store_remove_authorization(store, uuid);
+        if (r < 0 && errno != -ENOENT) {
+                log_error_errno(r, "Could not remove authorization: %m");
+                return EXIT_FAILURE;
+        }
+
+        r = tb_store_remove_device(store, uuid);
+        if (r < 0) {
+                log_error_errno(r, "Could not remove device: %m");
+                return EXIT_FAILURE;
+        }
+
+        return EXIT_SUCCESS;
+}
+
+static const struct CtlCmd cmd_forget = {
+        .name = "forget",
+        .func = forget_device,
+        .desc = "Remove a device from the database",
+        .root = true,
+};
+
 static const struct CtlCmd *ctrl_cmds[] = {
         &cmd_list,
         &cmd_authorize,
+        &cmd_forget,
 
         &cmd_udev
 };
