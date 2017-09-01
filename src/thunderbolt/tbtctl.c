@@ -105,8 +105,8 @@ static SecurityLevel device_get_security_level(struct udev_device *device) {
 
 
 typedef enum KeyStore {
-        TBT_KEYSTORE_EFIVARS,
-        TBT_KEYSTORE_FSDB,
+        TB_KEYSTORE_EFIVARS,
+        TB_KEYSTORE_FSDB,
 } KeyStore;
 
 enum {
@@ -136,10 +136,10 @@ typedef struct {
         char *name;
         char *vendor;
 
-} TbtDevice;
+} TbDevice;
 
-static void tbt_device_free(TbtDevice **device) {
-        TbtDevice *d;
+static void tb_device_free(TbDevice **device) {
+        TbDevice *d;
 
         if (!*device)
                 return;
@@ -154,18 +154,18 @@ static void tbt_device_free(TbtDevice **device) {
         *device = NULL;
 }
 
-#define _cleanup_tbt_device_ _cleanup_(tbt_device_free)
+#define _cleanup_tb_device_ _cleanup_(tb_device_free)
 
-#define TBT_STORE_PATH "/var/lib/tbt/"
+#define TB_STORE_PATH "/etc/thunderbolt/"
 
-typedef struct TbtStore TbtStore;
+typedef struct TbStore TbStore;
 
-struct TbtStore {
+struct TbStore {
         char *path;
         KeyStore keystore;
 };
 
-static void tbt_store_free(TbtStore *s) {
+static void tb_store_free(TbStore *s) {
         if (!s)
                 return;
 
@@ -173,19 +173,19 @@ static void tbt_store_free(TbtStore *s) {
         free(s);
 }
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(TbtStore*, tbt_store_free);
-#define _cleanup_store_free_ _cleanup_(tbt_store_freep)
+DEFINE_TRIVIAL_CLEANUP_FUNC(TbStore*, tb_store_free);
+#define _cleanup_store_free_ _cleanup_(tb_store_freep)
 
-static int tbt_store_new(TbtStore **ret) {
-        _cleanup_store_free_ TbtStore *s = NULL;
+static int tb_store_new(TbStore **ret) {
+        _cleanup_store_free_ TbStore *s = NULL;
 
-        s = new0(TbtStore, 1);
+        s = new0(TbStore, 1);
         if (!s)
                 return -ENOMEM;
 
 
-        s->path = strdup("/etc/thunderbolt");
-        s->keystore = TBT_KEYSTORE_EFIVARS;
+        s->path = strdup(TB_STORE_PATH);
+        s->keystore = TB_KEYSTORE_EFIVARS;
 
         *ret = s;
         s = NULL;
@@ -194,7 +194,7 @@ static int tbt_store_new(TbtStore **ret) {
 }
 
 
-static int tbt_store_parse_device(TbtDevice *device) {
+static int tb_store_parse_device(TbDevice *device) {
         const ConfigTableItem items[] = {
                 { "device", "name",         config_parse_string,           0, &device->name       },
                 { "device", "vendor-name",  config_parse_string,           0, &device->vendor     },
@@ -209,7 +209,7 @@ static int tbt_store_parse_device(TbtDevice *device) {
         assert(device);
         assert(device->uuid);
 
-        path = strjoina(TBT_STORE_PATH, "devices/", device->uuid);
+        path = strjoina(TB_STORE_PATH, "devices/", device->uuid);
 
         fd = open(path, O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW);
         if (fd < 0)
@@ -235,11 +235,11 @@ static int tbt_store_parse_device(TbtDevice *device) {
         return 0;
 }
 
-static int tbt_store_device_load(const char *uuid, TbtDevice **device) {
-        TbtDevice *d = NULL;
+static int tb_store_device_load(const char *uuid, TbDevice **device) {
+        TbDevice *d = NULL;
         int r;
 
-        d = new0(TbtDevice, 1);
+        d = new0(TbDevice, 1);
         if (!d) {
                 r = -ENOMEM;
                 goto out;
@@ -248,13 +248,13 @@ static int tbt_store_device_load(const char *uuid, TbtDevice **device) {
         d->uuid = strdup(uuid);
         if (d->uuid == NULL) {
                 r = -ENOMEM;
-                tbt_device_free(&d);
+                tb_device_free(&d);
                 goto out;
         }
 
-        r = tbt_store_parse_device(d);
+        r = tb_store_parse_device(d);
         if (r < 0) {
-                tbt_device_free(&d);
+                tb_device_free(&d);
         }
 
  out:
@@ -262,14 +262,14 @@ static int tbt_store_device_load(const char *uuid, TbtDevice **device) {
         return r;
 }
 
-static int tbt_store_have_key(const char *uuid) {
+static int tb_store_have_key(const char *uuid) {
         char *path;
         struct stat st;
         int r;
 
         assert(uuid);
 
-        path = strjoina(TBT_STORE_PATH, "keys/", uuid);
+        path = strjoina(TB_STORE_PATH, "keys/", uuid);
         r = stat(path, &st);
 
         if (r == -1)
@@ -286,7 +286,7 @@ static int tbt_store_have_key(const char *uuid) {
 #define KEY_BYTES 32
 #define KEY_CHARS 64          /* KEY_BYTES hex encoded */
 
-static int tbt_generate_key_string(char **key_out) {
+static int tb_generate_key_string(char **key_out) {
         uint8_t rnddata[KEY_BYTES];
         char *keydata;
         int i, r;
@@ -312,7 +312,7 @@ static int device_get_authorized(struct udev_device *device, unsigned *authorize
 
 static void device_print(struct udev_device *device)
 {
-        _cleanup_tbt_device_ TbtDevice *tbtdev = NULL;
+        _cleanup_tb_device_ TbDevice *tbdev = NULL;
         const char *name, *uuid, *vendor;
         unsigned authorized;
         int r;
@@ -363,20 +363,20 @@ static void device_print(struct udev_device *device)
         else
                 printf("%s\n", security_to_string(security));
 
-        r = tbt_store_device_load(uuid, &tbtdev);
+        r = tb_store_device_load(uuid, &tbdev);
         if (r < 0 && r != -ENOENT) {
                 store = "load error";
-        } else if (tbtdev == NULL) {
+        } else if (tbdev == NULL) {
                 store = "no";
         } else {
                 store = "yes";
         }
         printf("  %s in store:   %s\n", special_glyph(TREE_RIGHT), store);
 
-        if (tbtdev) {
+        if (tbdev) {
                 const char *key_str;
 
-                r = tbt_store_have_key(uuid);
+                r = tb_store_have_key(uuid);
                 if (r > -1)
                         key_str = "yes";
                 else if (r == -ENOENT)
@@ -484,7 +484,7 @@ static int store_efivars_get_auth(const char *uuid, Authorization *ret) {
         if (r < 0)
                 return r;
 
-        ret->store = TBT_KEYSTORE_EFIVARS;
+        ret->store = TB_KEYSTORE_EFIVARS;
 
         l = strlen(var);
         if (l == 1) {
@@ -500,7 +500,7 @@ static int store_efivars_get_auth(const char *uuid, Authorization *ret) {
         return -EIO;
 }
 
-static int store_get_authorization(TbtStore *store, const char *uuid, Authorization *ret) {
+static int store_get_authorization(TbStore *store, const char *uuid, Authorization *ret) {
         _cleanup_free_ char *p = NULL;
         struct stat st;
         char *path;
@@ -516,7 +516,7 @@ static int store_get_authorization(TbtStore *store, const char *uuid, Authorizat
                 return -errno;
         if (S_ISREG(st.st_mode)) {
                 ret->level = AUTHORIZED_USER;
-                ret->store = TBT_KEYSTORE_FSDB;
+                ret->store = TB_KEYSTORE_FSDB;
                 return 0;
         }
 
@@ -533,7 +533,7 @@ static int store_get_authorization(TbtStore *store, const char *uuid, Authorizat
         return r;
 }
 
-static int store_efivars_put_auth(TbtStore *store,
+static int store_efivars_put_auth(TbStore *store,
                                   const char *uuid,
                                   Authorization *auth) {
         _cleanup_free_ char *target = NULL;
@@ -573,7 +573,7 @@ static int store_efivars_put_auth(TbtStore *store,
 }
 
 
-static int store_fsdb_put_auth(TbtStore *store,
+static int store_fsdb_put_auth(TbStore *store,
                                const char *uuid,
                                Authorization *auth) {
 
@@ -581,7 +581,7 @@ static int store_fsdb_put_auth(TbtStore *store,
 }
 
 
-static int store_put_device(TbtStore *store,
+static int store_put_device(TbStore *store,
                             struct udev_device *device,
                             Authorization *auth) {
         _cleanup_fclose_ FILE *f = NULL;
@@ -596,11 +596,11 @@ static int store_put_device(TbtStore *store,
         vendor = udev_device_get_sysattr_value(device, "vendor_name");
 
         switch (store->keystore) {
-        case TBT_KEYSTORE_FSDB:
+        case TB_KEYSTORE_FSDB:
                 r = store_fsdb_put_auth(store, uuid, auth);
                 break;
 
-        case TBT_KEYSTORE_EFIVARS:
+        case TB_KEYSTORE_EFIVARS:
                 r = store_efivars_put_auth(store, uuid, auth);
                 break;
         }
@@ -674,7 +674,7 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
         _cleanup_udev_device_unref_ struct udev_device *device = NULL;
         _cleanup_authorization_reset_ Authorization auth = { 0, };
         _cleanup_closedir_ DIR *devdir = NULL;
-        _cleanup_store_free_ TbtStore *store = NULL;
+        _cleanup_store_free_ TbStore *store = NULL;
         _cleanup_free_ char *uuid = NULL;
         bool store_put = false;
         const char *syspath;
@@ -689,7 +689,7 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        r = tbt_store_new(&store);
+        r = tb_store_new(&store);
         if (r < 0) {
                 log_error_errno(r, "Couldn't open store: %m");
                 return EXIT_FAILURE;
@@ -745,7 +745,7 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
         }
 
         if (auth_want == AUTHORIZED_KEY && auth.level != AUTHORIZED_KEY) {
-                r = tbt_generate_key_string(&auth.key);
+                r = tb_generate_key_string(&auth.key);
                 if (r < 0) {
                         log_error_errno(auth_ctrl, "Could not generate key: %m");
                         return EXIT_FAILURE;
@@ -784,7 +784,7 @@ static const struct CtlCmd cmd_authorize = {
 static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
         _cleanup_udev_device_unref_ struct udev_device *device = NULL;
         _cleanup_closedir_ DIR *devdir = NULL;
-        _cleanup_store_free_ TbtStore *store = NULL;
+        _cleanup_store_free_ TbStore *store = NULL;
         _cleanup_authorization_reset_ Authorization auth = { 0, };
         _cleanup_free_ char *uuid = NULL;
         const char *syspath;
@@ -797,7 +797,7 @@ static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        r = tbt_store_new(&store);
+        r = tb_store_new(&store);
         if (r < 0) {
                 log_error_errno(r, "Couldn't open store: %m");
                 return EXIT_FAILURE;
