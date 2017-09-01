@@ -54,30 +54,6 @@ static inline const char* strunknown(const char *s) {
         return s ? s : "unknown";
 }
 
-static int read_one_line_consume_fd(int fd, char **line_out) {
-        _cleanup_fclose_ FILE *fp = NULL;
-        char line[LINE_MAX], *l;
-
-        fp = fdopen(fd, "re");
-        if (!fp)
-                return -errno;
-
-        l = fgets(line, sizeof(line), fp);
-        if (!l) {
-                if (ferror(fp))
-                        return errno > 0 ? -errno : -EIO;
-
-                line[0] = '\0';
-        }
-
-        l = strdup(truncate_nl(line));
-        if (!l)
-                return -ENOMEM;
-
-        *line_out = l;
-        return 0;
-}
-
 /*  */
 
 typedef enum SecurityLevel {
@@ -463,21 +439,32 @@ static const struct CtlCmd cmd_list = {
 #define FORMAT_SECURITY_MAX 2 /* one digit plus nul */
 
 static int device_read_uuid_at(int dirfd, char **uuid_out) {
-        char *uuid;
+        _cleanup_fclose_ FILE *fp = NULL;
+        char line[LINE_MAX], *l;
         int fd;
-        int r;
 
         fd = openat(dirfd, "unique_id", O_NOFOLLOW|O_CLOEXEC|O_RDONLY);
         if (fd < 0)
                 return -errno;
 
-        r = read_one_line_consume_fd(fd, &uuid);
-        if (r == 0) {
-                *uuid_out = uuid;
-                return r;
+        fp = fdopen(fd, "re");
+        if (!fp)
+                return -errno;
+
+        l = fgets(line, sizeof(line), fp);
+        if (!l) {
+                if (ferror(fp))
+                        return errno > 0 ? -errno : -EIO;
+
+                line[0] = '\0';
         }
 
-        return r;
+        l = strdup(truncate_nl(line));
+        if (!l)
+                return -ENOMEM;
+
+        *uuid_out = l;
+        return 0;
 }
 
 static int store_efivars_get_auth(const char *uuid, Authorization *ret) {
@@ -672,7 +659,7 @@ static int device_authorize_at(int dirfd, Authorization *auth) {
         if (fd < 0)
                 return -errno;
 
-        snprintf(buf, sizeof(buf), "%hhu", (uint8_t) auth->level);
+        xsprintf(buf, "%hhu", (uint8_t) auth->level);
         l = write(fd, buf, 1);
 
         if (l < 0)
