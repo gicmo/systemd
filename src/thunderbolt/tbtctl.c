@@ -744,21 +744,18 @@ static int tb_store_remove_device(TbStore *store, const char *uuid) {
         return 0;
 }
 
-static int tb_generate_key_string(char **key_out) {
+static char * tb_generate_key_string(void) {
         uint8_t rnddata[KEY_BYTES];
         char *keydata;
-        int i, r;
+        int i;
 
-        r = acquire_random_bytes(rnddata, KEY_BYTES, true);
-        if (r < 0)
-                return r;
+        random_bytes(rnddata, KEY_BYTES);
 
         keydata = malloc(KEY_CHARS + 1);
         for (i = 0; i < KEY_BYTES; i++)
                 snprintf(keydata + i*2, HEX_BYTES, "%02hhx", rnddata[i]);
 
-        *key_out = keydata;
-        return 0;
+        return keydata;
 }
 
 static int device_get_authorized(struct udev_device *device, unsigned *authorized) {
@@ -847,15 +844,70 @@ static void device_print(TbStore *store, TbDevice *device)
         printf("\n");
 }
 
-static int list_devices(struct udev *udev, int argc, char *argv[]) {
+static int list_devices_udev(struct udev *udev, Hashmap **ret) {
         _cleanup_udev_enumerate_unref_ struct udev_enumerate *enumerate = NULL;
+        struct udev_list_entry *list_entry = NULL, *first = NULL;
+        int r;
+
+        r = hashmap_ensure_allocated(ret, &string_hash_ops);
+                return r;
+
+        enumerate = udev_enumerate_new(udev);
+        if (enumerate == NULL)
+                return -ENOMEM;
+
+        r = udev_enumerate_add_match_subsystem(enumerate, "thunderbolt");
+        if (r < 0)
+                return r;
+
+        r = udev_enumerate_add_match_sysattr(enumerate, "unique_id", NULL);
+        if (r < 0)
+                return r;
+
+        r = udev_enumerate_scan_devices(enumerate);
+        if (r < 0)
+                return r;
+
+        first = udev_enumerate_get_list_entry(enumerate);
+        udev_list_entry_foreach(list_entry, first) {
+                TbDevice *device;
+                const char *name;
+
+                name = udev_list_entry_get_name(list_entry);
+                r = tb_device_new_from_syspath(udev, name, &device);
+                if (r < 0)
+                        continue;
+
+                hashmap_put(*ret, device->uuid, device);
+        }
+
+        return 0;
+}
+
+static TbDevice **devices_to_sorted_array(Hashmap *devices, unsigned *size) {
+        TbDevice **dl = NULL;
+        TbDevice *device;
+        TbDevice **i;
+        Iterator iter;
+        unsigned n;
+
+        n = hashmap_size(devices);
+        dl = i = new(TbDevice *, n);
+
+        HASHMAP_FOREACH(device, devices, iter)
+                *i++ = device;
+
+        qsort(dl, n, sizeof(TbDevice *), tb_device_ptr_compare);
+        *size = n;
+
+        return dl;
+}
+
+static int list_devices(struct udev *udev, int argc, char *argv[]) {
         _cleanup_hashmap_free_ Hashmap *devices = NULL;
         _cleanup_tb_store_free_ TbStore *store = NULL;
-        struct udev_list_entry *list_entry = NULL, *first = NULL;
         _cleanup_free_ TbDevice **dl = NULL;
         TbDevice *device = NULL;
-        TbDevice **di;
-        Iterator iter;
         unsigned i, n;
         int r;
 
@@ -865,38 +917,10 @@ static int list_devices(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        devices = hashmap_new(&string_hash_ops);
-        if (devices == NULL) {
-                log_oom();
+        r = list_devices_udev(udev, &devices);
+        if (r < 0) {
+                log_error_errno(r, "Could not list devices from udev: %m");
                 return EXIT_FAILURE;
-        }
-
-        enumerate = udev_enumerate_new(udev);
-        if (enumerate == NULL)
-                return EXIT_FAILURE;
-
-        r = udev_enumerate_add_match_subsystem(enumerate, "thunderbolt");
-        if (r < 0)
-                return EXIT_FAILURE;
-
-        r = udev_enumerate_add_match_sysattr(enumerate, "unique_id", NULL);
-        if (r < 0)
-                return EXIT_FAILURE;
-
-        r = udev_enumerate_scan_devices(enumerate);
-        if (r < 0)
-                return EXIT_FAILURE;
-
-        first = udev_enumerate_get_list_entry(enumerate);
-        udev_list_entry_foreach(list_entry, first) {
-                const char *name;
-
-                name = udev_list_entry_get_name(list_entry);
-                r = tb_device_new_from_syspath(udev, name, &device);
-                if (r < 0)
-                        continue;
-
-                hashmap_put(devices, device->uuid, device);
         }
 
         if (true) {
@@ -905,13 +929,11 @@ static int list_devices(struct udev *udev, int argc, char *argv[]) {
                         log_error_errno(r, "Could not load devices from DB: %m");
         }
 
-        n = hashmap_size(devices);
-        dl = di = new(TbDevice *, n);
-
-        HASHMAP_FOREACH(device, devices, iter)
-                *di++ = device;
-
-        qsort(dl, n, sizeof(TbDevice *), tb_device_ptr_compare);
+        dl = devices_to_sorted_array(devices, &n);
+        if (dl == NULL) {
+                log_oom();
+                return EXIT_FAILURE;
+        }
 
         for (i = 0; i < n; i++) {
                 device = dl[i];
@@ -928,17 +950,39 @@ static const struct CtlCmd cmd_list = {
         .desc = "List thunderbolt devices",
 };
 
+static int tb_device_can_authorize(TbDevice *dev, Authorization *auth, unsigned level) {
+        int r;
+        unsigned have;
+        SecurityLevel can;
 
+        r = device_get_authorized(dev->udev, &have);
+        if (r < 0)
+                return r;
+        else if (have != AUTHORIZED_MISSING)
+                return -EEXIST;
+
+        can = device_get_security_level(dev->udev);
+        if (can < 0)
+                return can;
+        if (can != SECURITY_USER && can != SECURITY_SECURE)
+                return -EDOM;
+        if (level > (unsigned) can)
+                return -ERANGE;
+        if (level == 0)
+                level = can;
+
+        if (level == AUTHORIZED_KEY && auth->level != level)
+                auth->key = tb_generate_key_string();
+
+        auth->level = level;
+        return 0;
+}
 
 static int authorize_user(struct udev *udev, int argc, char *argv[]) {
         _cleanup_tb_device_free_ TbDevice *device = NULL;
         _cleanup_authorization_reset_ Authorization auth = { 0, };
         _cleanup_tb_store_free_ TbStore *store = NULL;
-        _cleanup_free_ char *uuid = NULL;
-        bool store_put = false;
-        unsigned auth_have;
-        int auth_ctrl;
-        int auth_want = 0;
+        bool store_put = true;
         int r;
 
         if (argc < 2) {
@@ -959,28 +1003,7 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        r = device_get_authorized(device->udev, &auth_have);
-        if (r < 0) {
-                log_error_errno(r, "Failed to get device authorization: %m");
-                return EXIT_FAILURE;
-        } else if (auth_have != 0) {
-                log_error_errno(r, "Device already authorized");
-                return EXIT_FAILURE;
-        }
-
-        auth_ctrl = device_get_security_level(device->udev);
-        if (auth_ctrl < 0) {
-                log_error_errno(auth_ctrl, "Could not determine security level: %m");
-                return EXIT_FAILURE;
-        }
-
-        if (auth_want > auth_ctrl) {
-                log_error("Requested security level not supported by domain controller");
-                return EXIT_FAILURE;
-        } else if (auth_want == 0)
-                auth_want = auth_ctrl;
-
-        r = store_get_authorization(store, uuid, &auth);
+        r = store_get_authorization(store, device->uuid, &auth);
         if (r == -ENOENT) {
                 store_put = true;
         } else if (r < 0) {
@@ -988,15 +1011,19 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        if (auth_want == AUTHORIZED_KEY && auth.level != AUTHORIZED_KEY) {
-                r = tb_generate_key_string(&auth.key);
-                if (r < 0) {
-                        log_error_errno(auth_ctrl, "Could not generate key: %m");
-                        return EXIT_FAILURE;
-                }
-
-                auth_want = AUTHORIZED_USER;
-                store_put = true;
+        r = tb_device_can_authorize(device, &auth, 0);
+        if (r == -EEXIST) {
+                log_error("Device already authorized");
+                return EXIT_FAILURE;
+        } else if (r == -EDOM) {
+                log_error("Security level of controller insufficient");
+                return EXIT_FAILURE;
+        } else if (r == -ERANGE) {
+                log_error("Requested security level too high");
+                return EXIT_FAILURE;
+        } else if (r < 0) {
+                log_error_errno(r, "Failed to get device security level: %m");
+                return EXIT_FAILURE;
         }
 
         r = tb_device_authorize(device, &auth);
@@ -1029,7 +1056,6 @@ static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
         _cleanup_tb_device_free_ TbDevice *device = NULL;
         _cleanup_tb_store_free_ TbStore *store = NULL;
         _cleanup_authorization_reset_ Authorization auth = { 0, };
-        int auth_ctrl;
         int r;
 
         if (argc < 2) {
@@ -1059,13 +1085,17 @@ static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_SUCCESS;
         }
 
-        auth_ctrl = device_get_security_level(device->udev);
-        if (auth_ctrl < 0) {
-                log_error_errno(auth_ctrl, "Could not determine security level: %m");
+        r = tb_device_can_authorize(device, &auth, 0);
+        if (r == -EEXIST) {
+                log_error("Device already authorized");
+                return EXIT_FAILURE;
+        } else if (r == -EDOM) {
+                log_debug("Security level of controller insufficient");
+                return EXIT_SUCCESS; /* not an error */
+        } else if (r < 0) {
+                log_error_errno(r, "Failed to get device security level: %m");
                 return EXIT_FAILURE;
         }
-
-        auth.level = MIN((unsigned) auth_ctrl, auth.level);
 
         r = tb_device_authorize(device, &auth);
         if (r < 0) {
@@ -1132,7 +1162,6 @@ static const struct CtlCmd *ctrl_cmds[] = {
 
         &cmd_udev
 };
-
 
 
 static void help(void) {
