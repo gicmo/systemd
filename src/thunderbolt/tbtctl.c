@@ -909,7 +909,27 @@ static int list_devices(struct udev *udev, int argc, char *argv[]) {
         _cleanup_free_ TbDevice **dl = NULL;
         TbDevice *device = NULL;
         unsigned i, n;
-        int r;
+        int c, r;
+        bool show_all = false;
+
+        static const struct option options[] = {
+                { "all",    no_argument, NULL, 'a' },
+                {}
+
+        };
+
+        while ((c = getopt_long(argc, argv, "ah", options, NULL)) >= 0)
+                switch (c) {
+                case 'a':
+                        show_all = true;
+                        break;
+                case 'h':
+                        fprintf(stderr, "FIXME: need help\n");
+                        return EXIT_SUCCESS;
+                default:
+                        return EXIT_FAILURE;
+
+                }
 
         r = tb_store_new(&store);
         if (r < 0) {
@@ -923,7 +943,7 @@ static int list_devices(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        if (true) {
+        if (show_all) {
                 r = tb_store_load_missing(store, devices);
                 if (r < 0)
                         log_error_errno(r, "Could not load devices from DB: %m");
