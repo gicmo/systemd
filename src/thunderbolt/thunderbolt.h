@@ -25,6 +25,13 @@
 #include <sys/types.h>
 
 #include "libudev.h"
+#include "macro.h"
+
+#define FORMAT_SECURITY_MAX 2 /* one digit plus nul */
+#define HEX_BYTES 3           /* xx plus nul */
+#define KEY_BYTES 32
+#define KEY_CHARS 64          /* KEY_BYTES hex encoded */
+
 
 /* With the exception of AUTH_MISSING (-1) the following values
  * corresponds to sysfs 'authorized' value. */
@@ -44,6 +51,9 @@ typedef enum {
         _SECURITY_MAX,
         _SECURITY_INVALID = -1,
 } SecurityLevel;
+
+SecurityLevel security_from_string(const char *l) _pure_;
+const char *security_to_string(SecurityLevel l) _pure_;
 
 typedef enum  {
         STORE_NONE    = -1,
@@ -98,12 +108,11 @@ void tb_device_vec_free(TbDeviceVec **v);
 #define _cleanup_tb_device_vec_free_ _cleanup_(tb_device_vec_free)
 
 TbDeviceVec *tb_device_vec_ensure_allocated(TbDeviceVec **v);
-TbDevice *tb_device_vec_at(TbDeviceVec *v, unsigned i);
 bool tb_device_vec_contains_uuid(TbDeviceVec *v, const char *uuid);
 void tb_device_vec_push_back(TbDeviceVec *v, TbDevice *d);
 void tb_device_vec_sort(TbDeviceVec *v);
 
-inline TbDevice *tb_device_vec_at(TbDeviceVec *v, unsigned i) {
+static inline TbDevice *tb_device_vec_at(TbDeviceVec *v, unsigned i) {
         assert(v);
         assert(i < v->n);
 
@@ -130,3 +139,4 @@ int tb_store_load_missing(TbStore *store, TbDeviceVec **devices);
 int store_get_auth(TbStore *store, const char *uuid, Auth *ret);
 int tb_store_remove_auth(TbStore *store, const char *uuid);
 int tb_store_remove_device(TbStore *store, const char *uuid);
+int store_put_device(TbStore *store, TbDevice *device, Auth *auth);
