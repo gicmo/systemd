@@ -122,6 +122,7 @@ typedef struct {
         DIR *devdir;
 
         char *uuid;
+        AuthLevel authorized;
 
         char *name;
         char *vendor;
@@ -231,13 +232,12 @@ static SecurityLevel device_get_security_level(struct udev_device *device) {
         return security_from_string(security);
 }
 
-
-static int device_read_uuid_at(int dirfd, char **uuid_out) {
-        _cleanup_fclose_ FILE *fp = NULL;
+static int read_single_line_at(int dirfd, const char *name, char **l_out) {
+   _cleanup_fclose_ FILE *fp = NULL;
         char line[LINE_MAX], *l;
         int fd;
 
-        fd = openat(dirfd, "unique_id", O_NOFOLLOW|O_CLOEXEC|O_RDONLY);
+        fd = openat(dirfd, name, O_NOFOLLOW|O_CLOEXEC|O_RDONLY);
         if (fd < 0)
                 return -errno;
 
@@ -257,59 +257,9 @@ static int device_read_uuid_at(int dirfd, char **uuid_out) {
         if (!l)
                 return -ENOMEM;
 
-        *uuid_out = l;
+        *l_out = l;
         return 0;
 }
-
-
-static int device_authorize_at(int dirfd, Auth *auth) {
-        char buf[FORMAT_SECURITY_MAX];
-        _cleanup_close_ int fd = -1;
-        AuthLevel lv;
-        ssize_t l;
-
-        if (auth->level != AUTH_USER && auth->level != AUTH_KEY)
-                return -EINVAL;
-
-        lv = auth->level;
-
-        if (lv == AUTH_KEY) {
-                _cleanup_close_ int key_fd = -1;
-
-                if (auth->key == NULL)
-                        return -EINVAL;
-
-                key_fd = openat(dirfd, "key", O_WRONLY|O_CLOEXEC|O_NOCTTY);
-                if (key_fd < 0)
-                        return -errno;
-
-                l = write(key_fd, auth->key, KEY_CHARS);
-
-                if (l < 0)
-                        return -errno;
-                else if (l != KEY_CHARS)
-                        return -EIO;
-
-                if (auth->store == STORE_NONE)
-                        lv = AUTH_USER;
-
-        }
-
-        fd = openat(dirfd, "authorized", O_WRONLY|O_CLOEXEC|O_WRONLY);
-        if (fd < 0)
-                return -errno;
-
-        xsprintf(buf, "%hhu", (uint8_t) lv);
-        l = write(fd, buf, 1);
-
-        if (l < 0)
-                return -errno;
-        else if (l != 1)
-                return -EIO;
-
-        return 0;
-}
-
 
 static char *get_sysattr_name(struct udev_device *udev, const char *attr) {
         char *s;
@@ -328,6 +278,7 @@ static char *get_sysattr_name(struct udev_device *udev, const char *attr) {
 
 static int tb_device_new_from_udev(struct udev_device *udev, TbDevice **ret) {
         _cleanup_tb_device_free_ TbDevice *d = NULL;
+        _cleanup_free_ char *val = NULL;
         const char *syspath;
         int r;
 
@@ -340,7 +291,15 @@ static int tb_device_new_from_udev(struct udev_device *udev, TbDevice **ret) {
         if (!d->devdir)
                 return -errno;
 
-        r = device_read_uuid_at(dirfd(d->devdir), &d->uuid);
+        r = read_single_line_at(dirfd(d->devdir), "unique_id", &d->uuid);
+        if (r < 0)
+                return r;
+
+        r = read_single_line_at(dirfd(d->devdir), "authorized", &val);
+        if (r < 0)
+                return r;
+
+        r = safe_atoi(val, &d->authorized);
         if (r < 0)
                 return r;
 
@@ -368,6 +327,11 @@ static int tb_device_new_from_syspath(struct udev *udev, const char *path, TbDev
 }
 
 static int tb_device_authorize(TbDevice *dev, Auth *auth) {
+        char buf[FORMAT_SECURITY_MAX];
+        _cleanup_close_ int fd = -1;
+        AuthLevel l;
+        ssize_t n;
+        int dfd;
 
         assert(dev);
         assert(auth);
@@ -376,7 +340,46 @@ static int tb_device_authorize(TbDevice *dev, Auth *auth) {
         if (dev->devdir == NULL)
                 return -EINVAL;
 
-        return device_authorize_at(dirfd(dev->devdir), auth);
+        dfd = dirfd(dev->devdir);
+        l = auth->level;
+
+        if (l == AUTH_KEY) {
+                _cleanup_close_ int key_fd = -1;
+
+                if (auth->key == NULL)
+                        return -EINVAL;
+
+                key_fd = openat(dfd, "key", O_WRONLY|O_CLOEXEC);
+                if (key_fd < 0)
+                        return -errno;
+
+                n = write(key_fd, auth->key, KEY_CHARS);
+
+                if (n < 0)
+                        return -errno;
+                else if (n != KEY_CHARS)
+                        return -EIO;
+
+                /* if the key is not stored, we need to use
+                 * AUTH_USER to write the new key to the device */
+                if (auth->store == STORE_NONE)
+                        l = AUTH_USER;
+
+        }
+
+        fd = openat(dfd, "authorized", O_WRONLY|O_CLOEXEC);
+        if (fd < 0)
+                return -errno;
+
+        xsprintf(buf, "%hhu", (uint8_t) l);
+        n = write(fd, buf, 1);
+
+        if (n < 0)
+                return -errno;
+        else if (n != 1)
+                return -EIO;
+
+        return 0;
 }
 
 #define TB_STORE_PATH "/etc/thunderbolt"
@@ -493,7 +496,7 @@ static int tb_store_device_load(const char *uuid, TbDevice **device) {
 
 
 static int store_efivars_get_auth(const char *uuid, Auth *ret) {
-        _cleanup_free_ char *var = NULL;
+        _cleanup_free_ void *var = NULL;
         sd_id128_t id;
         size_t l;
         int r;
@@ -505,18 +508,16 @@ static int store_efivars_get_auth(const char *uuid, Auth *ret) {
                 return -EINVAL;
         }
 
-        r = efi_get_variable_string(id, "Thunderbolt", &var);
+        r = efi_get_variable(id, "Thunderbolt", NULL, &var, &l);
         if (r < 0)
                 return r;
 
         ret->store = STORE_EFIVARS;
-
-        l = strlen(var);
         if (l == 1) {
                 return safe_atoi(var, &ret->level);
         } else if (l == KEY_CHARS) {
                 ret->level = AUTH_KEY;
-                ret->key = var;
+                ret->key = (char *) var;
                 var = NULL;
                 return 0;
         }
@@ -537,13 +538,12 @@ static int store_get_auth(TbStore *store, const char *uuid, Auth *ret) {
         path = strjoina(store->path, "/authorization/", uuid);
 
         r = lstat(path, &st);
-        if (r < 0 && errno != ENOENT)
-                return -errno;
-        if (errno == ENOENT) {
+        if (r < 0 && errno == ENOENT) {
                 ret->level = AUTH_MISSING;
                 return 0;
         }
-
+        if (r < 0)
+                return -errno;
         if (S_ISREG(st.st_mode)) {
                 ret->level = AUTH_USER;
                 ret->store = STORE_FSDB;
@@ -554,12 +554,14 @@ static int store_get_auth(TbStore *store, const char *uuid, Auth *ret) {
         if (r < 0)
                 return r;
 
+        r = -ENOTSUP;
         if (startswith(p, "/sys/firmware/efi/efivars")) {
                 r = store_efivars_get_auth(uuid, ret);
         } else if (startswith(p, store->path)) {
                 r = -ENOTSUP;
-        } else {
-                r = -ENOTSUP;
+        }
+
+        if (r == -ENOTSUP) {
                 ret->level = AUTH_MISSING;
                 ret->store = STORE_NONE;
         }
@@ -792,18 +794,6 @@ static void auth_generate_key_string(Auth *a) {
         a->store = STORE_NONE;
 }
 
-static int device_get_authorized(struct udev_device *device, int *authorized) {
-        const char *str;
-
-        if (device == NULL) {
-                *authorized = AUTH_MISSING;
-                return 0;
-        }
-
-        str = udev_device_get_sysattr_value(device, "authorized");
-        return safe_atoi(str, authorized);
-}
-
 static void device_print(TbStore *store, TbDevice *device)
 {
         SecurityLevel security;
@@ -811,28 +801,22 @@ static void device_print(TbStore *store, TbDevice *device)
         const char *status;
         const char *st_sym, *st_con, *st_coff;
         const char *policy_str;
-        int authorized;
         int r;
         bool in_store;
 
-        r = device_get_authorized(device->udev, &authorized);
-        if (r < 0) {
-                status = "unknown (error)";
-                st_con = ansi_highlight_red();
-                st_sym = special_glyph(BLACK_CIRCLE);
-        } else if (authorized == AUTH_MISSING) {
+        if (device->authorized == AUTH_MISSING) {
                 status = "offline";
                 st_con = ansi_highlight_blue();;
                 st_sym = special_glyph(BLACK_CIRCLE);
-        } else if (authorized == AUTH_NEEDED) {
+        } else if (device->authorized == AUTH_NEEDED) {
                 status = "unauthorized";
                 st_con = ansi_highlight_yellow();
                 st_sym = special_glyph(BLACK_CIRCLE);
-        } else if (authorized == AUTH_USER) {
+        } else if (device->authorized == AUTH_USER) {
                 status = "authorized (user)";
                 st_con = ansi_highlight_green();
                 st_sym = special_glyph(BLACK_CIRCLE);
-        } else if (authorized ==  AUTH_KEY) {
+        } else if (device->authorized ==  AUTH_KEY) {
                 status = "authorized (key)";
                 st_con = ansi_highlight_green();
                 st_sym = special_glyph(BLACK_CIRCLE);
@@ -849,7 +833,7 @@ static void device_print(TbStore *store, TbDevice *device)
         printf("  %s uuid:       %s\n", special_glyph(TREE_BRANCH), device->uuid);
         printf("  %s status:     %s\n", special_glyph(TREE_BRANCH), status);
 
-        if (authorized > AUTH_MISSING) {
+        if (device->udev != NULL) {
                 printf("  %s security:   ", special_glyph(TREE_BRANCH));
 
                 security = device_get_security_level(device->udev);
@@ -1014,7 +998,6 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
         _cleanup_auth_reset_ Auth auth = { 0, };
         _cleanup_tb_store_free_ TbStore *store = NULL;
         SecurityLevel sl;
-        int authorized;
         int r;
 
         if (argc < 2) {
@@ -1035,12 +1018,7 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        r = device_get_authorized(device->udev, &authorized);
-        if (r < 0) {
-                log_error_errno(r, "Failed to get current authorization: %m");
-                return EXIT_FAILURE;
-        }
-        if (authorized != AUTH_NEEDED) {
+        if (device->authorized != AUTH_NEEDED) {
                 log_error("Device already authorized");
                 return EXIT_FAILURE;
         }
@@ -1061,10 +1039,8 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        if (auth.level == AUTH_MISSING) {
+        if (auth.level == AUTH_MISSING)
                 auth.level = sl;
-                auth.store = STORE_NONE;
-        }
         if (auth.level == AUTH_KEY && auth.key == NULL)
                 auth_generate_key_string(&auth);
 
@@ -1124,7 +1100,8 @@ static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        if (auth.level == AUTH_MISSING || auth.level == AUTH_NEEDED) {
+        if (!auth_level_can_authorize(auth.level)) {
+                log_debug("Unknown or ignored device: %s", device->uuid);
                 /* Unknown or ignored device */
                 return EXIT_SUCCESS;
         }
@@ -1294,7 +1271,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (cmd->root && geteuid() != 0) {
-                fprintf(stderr, "%s %s must be invoked as root.",
+                fprintf(stderr, "%s %s must be invoked as root.\n",
                 program_invocation_short_name, cmdname);
                 return EXIT_FAILURE;
         }
