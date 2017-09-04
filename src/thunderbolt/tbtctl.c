@@ -17,13 +17,13 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include "thunderbolt.h"
+
 #include <getopt.h>
 #include <linux/fs.h>
 #include <locale.h>
 #include <sys/ioctl.h>
 #include <sys/sendfile.h>
-
-#include "libudev.h"
 
 #include "conf-parser.h"
 #include "chattr-util.h"
@@ -47,12 +47,6 @@
 #include "umask-util.h"
 #include "util.h"
 
-
-#define FORMAT_SECURITY_MAX 2 /* one digit plus nul */
-#define HEX_BYTES 3            /* xx plus nul */
-#define KEY_BYTES 32
-#define KEY_CHARS 64          /* KEY_BYTES hex encoded */
-
 struct CtlCmd {
         const char *name;
         int       (*func) (struct udev *udev, int argc, char *argv[]);
@@ -60,16 +54,12 @@ struct CtlCmd {
         bool        root;
 };
 
-/*  */
 
-typedef enum SecurityLevel {
-        SECURITY_NONE    = 0,
-        SECURITY_USER    = 1,
-        SECURITY_SECURE  = 2,
-        SECURITY_DPONLY  = 3,
-        _SECURITY_MAX,
-        _SECURITY_INVALID = -1,
-} SecurityLevel;
+#define FORMAT_SECURITY_MAX 2 /* one digit plus nul */
+#define HEX_BYTES 3            /* xx plus nul */
+#define KEY_BYTES 32
+#define KEY_CHARS 64          /* KEY_BYTES hex encoded */
+
 
 /* the strings here correspond to the values reported
  * in sysfs ('security' attribute) for the domain  */
@@ -81,55 +71,28 @@ static const char* const security_table[_SECURITY_MAX] = {
 };
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP(security, SecurityLevel);
 
-typedef enum Store {
-        STORE_NONE    = -1,
-        STORE_DEFAULT = 0,
-        STORE_EFIVARS,
-        STORE_FSDB,
-} Store;
-
-/* With the exception of MISSIING (-1) the following values
- * corresponds to sysfs 'authorized' value. */
-typedef enum {
-        AUTH_MISSING = -1,
-        AUTH_NEEDED  = 0,
-        AUTH_USER    = 1,
-        AUTH_KEY     = 2,
-} AuthLevel;
-
-static bool auth_level_can_authorize(AuthLevel lv) {
-        return lv == AUTH_USER || lv == AUTH_KEY;
-}
-
-typedef struct Auth {
-        int level;
-        char *key;
-        Store store;
-} Auth;
-#define AUTH_INITIALIZER {-1, NULL, -1}
-
-static void auth_reset(Auth *a) {
+void auth_reset(Auth *a) {
         a->key = string_free_erase(a->key);
         a->level = AUTH_MISSING;
         a->store = 0;
 }
 
-#define _cleanup_auth_reset_ _cleanup_(auth_reset)
+void auth_generate_key_string(Auth *a) {
+        uint8_t rnddata[KEY_BYTES];
+        char *keydata;
+        int i;
 
-typedef struct {
+        random_bytes(rnddata, KEY_BYTES);
 
-        struct udev_device *udev;
-        DIR *devdir;
+        keydata = malloc(KEY_CHARS + 1);
+        for (i = 0; i < KEY_BYTES; i++)
+                snprintf(keydata + i*2, HEX_BYTES, "%02hhx", rnddata[i]);
 
-        char *uuid;
-        AuthLevel authorized;
+        a->key = keydata;
+        a->store = STORE_NONE;
+}
 
-        char *name;
-        char *vendor;
-
-} TbDevice;
-
-static void tb_device_free(TbDevice **device) {
+void tb_device_free(TbDevice **device) {
         TbDevice *d;
 
         if (!*device)
@@ -150,10 +113,8 @@ static void tb_device_free(TbDevice **device) {
         *device = NULL;
 }
 
-#define _cleanup_tb_device_free_ _cleanup_(tb_device_free)
-
 // -1, a < b; 0, a == b; 1, a > b
-static int tb_device_compare(const void *ia, const void *ib) {
+int tb_device_compare(const void *ia, const void *ib) {
         const TbDevice *a = ia;
         const TbDevice *b = ib;
         const char *pa, *pb;
@@ -275,8 +236,7 @@ static char *get_sysattr_name(struct udev_device *udev, const char *attr) {
         return strdup(v);
 }
 
-
-static int tb_device_new_from_udev(struct udev_device *udev, TbDevice **ret) {
+int tb_device_new_from_udev(struct udev_device *udev, TbDevice **ret) {
         _cleanup_tb_device_free_ TbDevice *d = NULL;
         _cleanup_free_ char *val = NULL;
         const char *syspath;
@@ -316,7 +276,7 @@ static int tb_device_new_from_udev(struct udev_device *udev, TbDevice **ret) {
         return 0;
 }
 
-static int tb_device_new_from_syspath(struct udev *udev, const char *path, TbDevice **d) {
+int tb_device_new_from_syspath(struct udev *udev, const char *path, TbDevice **d) {
         _cleanup_udev_device_unref_ struct udev_device *udevice = NULL;
 
         udevice = udev_device_new_from_syspath(udev, path);
@@ -326,7 +286,7 @@ static int tb_device_new_from_syspath(struct udev *udev, const char *path, TbDev
         return tb_device_new_from_udev(udevice, d);
 }
 
-static int tb_device_authorize(TbDevice *dev, Auth *auth) {
+int tb_device_authorize(TbDevice *dev, Auth *auth) {
         char buf[FORMAT_SECURITY_MAX];
         _cleanup_close_ int fd = -1;
         AuthLevel l;
@@ -382,27 +342,20 @@ static int tb_device_authorize(TbDevice *dev, Auth *auth) {
         return 0;
 }
 
-#define TB_STORE_PATH "/etc/thunderbolt"
+void tb_store_free(TbStore **store) {
+        TbStore *s;
 
-typedef struct TbStore TbStore;
-
-struct TbStore {
-        char *path;
-        Store store;
-};
-
-static void tb_store_free(TbStore *s) {
-        if (!s)
+        if (!store)
                 return;
+
+        s = *store;
 
         free(s->path);
         free(s);
+        *store = NULL;
 }
 
-DEFINE_TRIVIAL_CLEANUP_FUNC(TbStore*, tb_store_free);
-#define _cleanup_tb_store_free_ _cleanup_(tb_store_freep)
-
-static int tb_store_new(TbStore **ret) {
+int tb_store_new(TbStore **ret) {
         _cleanup_tb_store_free_ TbStore *s = NULL;
         const char *val;
 
@@ -467,7 +420,7 @@ static int tb_store_parse_device(TbDevice *device) {
         return 0;
 }
 
-static int tb_store_device_load(const char *uuid, TbDevice **device) {
+int tb_store_device_load(const char *uuid, TbDevice **device) {
         TbDevice *d = NULL;
         int r;
 
@@ -526,7 +479,7 @@ static int store_efivars_get_auth(const char *uuid, Auth *ret) {
         return -EIO;
 }
 
-static int store_get_auth(TbStore *store, const char *uuid, Auth *ret) {
+int store_get_auth(TbStore *store, const char *uuid, Auth *ret) {
         _cleanup_free_ char *p = NULL;
         struct stat st;
         char *path;
@@ -664,7 +617,7 @@ static int store_put_device(TbStore *store,
         return fflush_and_check(f);
 }
 
-static bool tb_store_have_device(TbStore *store, const char *uuid) {
+bool tb_store_have_device(TbStore *store, const char *uuid) {
         char *p;
         struct stat st;
 
@@ -677,7 +630,7 @@ static bool tb_store_have_device(TbStore *store, const char *uuid) {
         return stat(p, &st) == 0;
 }
 
-static int tb_store_list_ids(TbStore *store, char ***ret) {
+int tb_store_list_ids(TbStore *store, char ***ret) {
         _cleanup_closedir_ DIR *d = NULL;
         struct dirent *de;
         char *p;
@@ -725,7 +678,7 @@ static int tb_store_load_missing(TbStore *store, Hashmap *devices) {
         return 0;
 }
 
-static int tb_store_remove_auth(TbStore *store, const char *uuid) {
+int tb_store_remove_auth(TbStore *store, const char *uuid) {
         _cleanup_free_ char *p = NULL;
         struct stat st;
         char *path;
@@ -764,7 +717,7 @@ static int tb_store_remove_auth(TbStore *store, const char *uuid) {
         return r < 0 ? -errno : 0;
 }
 
-static int tb_store_remove_device(TbStore *store, const char *uuid) {
+int tb_store_remove_device(TbStore *store, const char *uuid) {
         char *p;
         int r;
 
@@ -777,21 +730,6 @@ static int tb_store_remove_device(TbStore *store, const char *uuid) {
                 return -errno;
 
         return 0;
-}
-
-static void auth_generate_key_string(Auth *a) {
-        uint8_t rnddata[KEY_BYTES];
-        char *keydata;
-        int i;
-
-        random_bytes(rnddata, KEY_BYTES);
-
-        keydata = malloc(KEY_CHARS + 1);
-        for (i = 0; i < KEY_BYTES; i++)
-                snprintf(keydata + i*2, HEX_BYTES, "%02hhx", rnddata[i]);
-
-        a->key = keydata;
-        a->store = STORE_NONE;
 }
 
 static void device_print(TbStore *store, TbDevice *device)
