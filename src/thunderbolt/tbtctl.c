@@ -165,13 +165,13 @@ const struct hash_ops tb_device_hash_ops = {
 
 };
 
-static SecurityLevel device_get_security_level(struct udev_device *device) {
+SecurityLevel tb_device_get_security_level(TbDevice *device) {
         struct udev_device *parent;
         const char *security;
         bool found;
 
         found = false;
-        parent = device;
+        parent = device->udev;
         do {
                 const char *name;
                 parent = udev_device_get_parent(parent);
@@ -342,6 +342,12 @@ int tb_device_authorize(TbDevice *dev, Auth *auth) {
         return 0;
 }
 
+bool tb_device_is_online(TbDevice *dev) {
+        assert(dev);
+
+        return dev->udev != NULL;
+}
+
 void tb_store_free(TbStore **store) {
         TbStore *s;
 
@@ -379,7 +385,7 @@ int tb_store_new(TbStore **ret) {
 }
 
 
-static int tb_store_parse_device(TbDevice *device) {
+static int tb_store_parse_device(TbStore *store, TbDevice *device) {
         const ConfigTableItem items[] = {
                 { "device", "name",    config_parse_string,  0, &device->name    },
                 { "device", "vendor",  config_parse_string,  0, &device->vendor  },
@@ -394,7 +400,7 @@ static int tb_store_parse_device(TbDevice *device) {
         assert(device);
         assert(device->uuid);
 
-        path = strjoina(TB_STORE_PATH, "devices/", device->uuid);
+        path = strjoina(store->path, "/devices/", device->uuid);
 
         fd = open(path, O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW);
         if (fd < 0)
@@ -420,9 +426,13 @@ static int tb_store_parse_device(TbDevice *device) {
         return 0;
 }
 
-int tb_store_device_load(const char *uuid, TbDevice **device) {
+int tb_store_device_load(TbStore *store, const char *uuid, TbDevice **device) {
         TbDevice *d = NULL;
         int r;
+
+        assert(store);
+        assert(device);
+        assert(uuid);
 
         d = new0(TbDevice, 1);
         if (!d) {
@@ -437,7 +447,7 @@ int tb_store_device_load(const char *uuid, TbDevice **device) {
                 goto out;
         }
 
-        r = tb_store_parse_device(d);
+        r = tb_store_parse_device(store, d);
         if (r < 0) {
                 tb_device_free(&d);
         }
@@ -666,7 +676,7 @@ static int tb_store_load_missing(TbStore *store, Hashmap *devices) {
                 if (hashmap_contains(devices, id))
                         continue;
 
-                r = tb_store_device_load(id, &device);
+                r = tb_store_device_load(store, id, &device);
                 if (r < 0) {
                         log_warning_errno(r, "Could not load device %s from DB: %m", id);
                         continue;
@@ -771,10 +781,10 @@ static void device_print(TbStore *store, TbDevice *device)
         printf("  %s uuid:       %s\n", special_glyph(TREE_BRANCH), device->uuid);
         printf("  %s status:     %s\n", special_glyph(TREE_BRANCH), status);
 
-        if (device->udev != NULL) {
+        if (tb_device_is_online(device)) {
                 printf("  %s security:   ", special_glyph(TREE_BRANCH));
 
-                security = device_get_security_level(device->udev);
+                security = tb_device_get_security_level(device);
                 if (security == _SECURITY_INVALID)
                         printf("unknown\n");
                 else
@@ -961,7 +971,7 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        sl = device_get_security_level(device->udev);
+        sl = tb_device_get_security_level(device);
         if (sl < 0) {
                 log_error_errno(r, "Failed to get host controller security level");
                 return EXIT_FAILURE;
@@ -1044,7 +1054,7 @@ static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_SUCCESS;
         }
 
-        sl = device_get_security_level(device->udev);
+        sl = tb_device_get_security_level(device);
         if (sl < 0) {
                 log_error_errno(sl, "Failed to determine security level");
                 return EXIT_FAILURE;

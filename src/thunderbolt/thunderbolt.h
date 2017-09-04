@@ -81,8 +81,11 @@ void tb_device_free(TbDevice **device);
 
 int tb_device_new_from_udev(struct udev_device *udev, TbDevice **ret);
 int tb_device_new_from_syspath(struct udev *udev, const char *path, TbDevice **d);
-int tb_device_compare(const void *ia, const void *ib);
 int tb_device_authorize(TbDevice *dev, Auth *auth);
+int tb_device_compare(const void *ia, const void *ib);
+SecurityLevel tb_device_get_security_level(TbDevice *device);
+bool tb_device_is_online(TbDevice *dev);
+
 
 /* Store related functions */
 #define TB_STORE_PATH "/etc/thunderbolt"
@@ -99,7 +102,7 @@ void tb_store_free(TbStore **s);
 int tb_store_new(TbStore **ret);
 int tb_store_list_ids(TbStore *store, char ***ret);
 bool tb_store_have_device(TbStore *store, const char *uuid);
-int tb_store_device_load(const char *uuid, TbDevice **device);
+int tb_store_device_load(TbStore *store, const char *uuid, TbDevice **device);
 int store_get_auth(TbStore *store, const char *uuid, Auth *ret);
 int tb_store_remove_auth(TbStore *store, const char *uuid);
 int tb_store_remove_device(TbStore *store, const char *uuid);
