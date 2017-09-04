@@ -850,6 +850,7 @@ static int list_devices_udev(struct udev *udev, Hashmap **ret) {
         int r;
 
         r = hashmap_ensure_allocated(ret, &string_hash_ops);
+        if (r < 0)
                 return r;
 
         enumerate = udev_enumerate_new(udev);
