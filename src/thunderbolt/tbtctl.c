@@ -86,21 +86,25 @@ typedef enum KeyStore {
         TB_KEYSTORE_FSDB,
 } KeyStore;
 
-enum {
-        AUTHORIZED_MISSING = 0,
-        AUTHORIZED_USER = 1,
-        AUTHORIZED_KEY = 2,
-};
+/* With the exception of MISSIING (-1) the following values
+ * corresponds to sysfs 'authorized' value. */
+typedef enum {
+        AUTH_MISSING = -1,
+        AUTH_NEEDED  = 0,
+        AUTH_USER    = 1,
+        AUTH_KEY     = 2,
+} AuthLevel;
 
 typedef struct Authorization {
-        unsigned level; /* corresponds to sysfs 'authorized' value */
+        int level;
         char *key;
         KeyStore store;
 } Authorization;
+#define AUTHORIZATION_INITIALIZER {-1, NULL, -1}
 
 static void authorization_reset(Authorization *a) {
         a->key = string_free_erase(a->key);
-        a->level = AUTHORIZED_MISSING;
+        a->level = AUTH_MISSING;
         a->store = 0;
 }
 
@@ -257,11 +261,11 @@ static int device_authorize_at(int dirfd, Authorization *auth) {
         _cleanup_close_ int fd = -1;
         ssize_t l;
 
-        if (auth->level != AUTHORIZED_USER && auth->level != AUTHORIZED_KEY)
+        if (auth->level != AUTH_USER && auth->level != AUTH_KEY)
                 return -EINVAL;
 
          /* logging? */
-        if (auth->level == AUTHORIZED_KEY) {
+        if (auth->level == AUTH_KEY) {
                 _cleanup_close_ int key_fd = -1;
 
                 if (auth->key == NULL)
@@ -492,9 +496,9 @@ static int store_efivars_get_auth(const char *uuid, Authorization *ret) {
 
         l = strlen(var);
         if (l == 1) {
-                return safe_atou(var, &ret->level);
+                return safe_atoi(var, &ret->level);
         } else if (l == KEY_CHARS) {
-                ret->level = AUTHORIZED_KEY;
+                ret->level = AUTH_KEY;
                 ret->key = var;
                 var = NULL;
                 return 0;
@@ -519,7 +523,7 @@ static int store_get_authorization(TbStore *store, const char *uuid, Authorizati
         if (r < 0)
                 return -errno;
         if (S_ISREG(st.st_mode)) {
-                ret->level = AUTHORIZED_USER;
+                ret->level = AUTH_USER;
                 ret->store = TB_KEYSTORE_FSDB;
                 return 0;
         }
@@ -556,7 +560,7 @@ static int store_efivars_put_auth(TbStore *store,
                 return -EINVAL;
         }
 
-        if (auth->level == AUTHORIZED_KEY) {
+        if (auth->level == AUTH_KEY) {
                 r = efi_set_variable(id, "Thunderbolt", auth->key, KEY_CHARS);
         } else {
                 xsprintf(buf, "%hhu", (uint8_t) auth->level);
@@ -758,62 +762,71 @@ static char * tb_generate_key_string(void) {
         return keydata;
 }
 
-static int device_get_authorized(struct udev_device *device, unsigned *authorized) {
+static int device_get_authorized(struct udev_device *device, int *authorized) {
         const char *str;
 
-        if (device == NULL)
-                return -ENODEV;
+        if (device == NULL) {
+                *authorized = AUTH_MISSING;
+                return 0;
+        }
 
         str = udev_device_get_sysattr_value(device, "authorized");
-        return safe_atou(str, authorized);
+        return safe_atoi(str, authorized);
 }
 
 static void device_print(TbStore *store, TbDevice *device)
 {
-        unsigned authorized;
-        int r;
-        const char *auth_level;
-        const char *auth_sym, *auth_con, *auth_coff;
-        bool in_store;
         SecurityLevel security;
-        Authorization auth = {0, };
+        Authorization auth = AUTHORIZATION_INITIALIZER;
+        const char *status;
+        const char *st_sym, *st_con, *st_coff;
         const char *policy_str;
+        int authorized;
+        int r;
+        bool in_store;
 
         r = device_get_authorized(device->udev, &authorized);
-        if (r == -ENODEV) {
-                auth_level = "offline";
-                auth_con = ansi_highlight_blue();;
-                auth_sym = special_glyph(BLACK_CIRCLE);
-        } else if (r < 0) {
-                auth_level = "unknown (error)";
-                auth_con = ansi_highlight_red();
-                auth_sym = special_glyph(BLACK_CIRCLE);
-        } else if (authorized == AUTHORIZED_MISSING) {
-                auth_level = "unauthorized";
-                auth_con = ansi_highlight_yellow();
-                auth_sym = special_glyph(BLACK_CIRCLE);
-        } else if (authorized == AUTHORIZED_USER) {
-                auth_level = "authorized (user)";
-                auth_con = ansi_highlight_green();
-                auth_sym = special_glyph(BLACK_CIRCLE);
-        } else if (authorized == AUTHORIZED_KEY) {
-                auth_level = "authorized (key)";
-                auth_con = ansi_highlight_green();
-                auth_sym = special_glyph(BLACK_CIRCLE);
-        } else {
-                auth_level = "unknown authorization";
-                auth_con = ansi_highlight_red();
-                auth_sym = special_glyph(BLACK_CIRCLE);
+        if (r < 0) {
+                status = "unknown (error)";
+                st_con = ansi_highlight_red();
+                st_sym = special_glyph(BLACK_CIRCLE);
+        }
+        switch (authorized) {
+        case AUTH_MISSING:
+                status = "offline";
+                st_con = ansi_highlight_blue();;
+                st_sym = special_glyph(BLACK_CIRCLE);
+                break;
+        case AUTH_NEEDED:
+                status = "unauthorized";
+                st_con = ansi_highlight_yellow();
+                st_sym = special_glyph(BLACK_CIRCLE);
+                break;
+        case AUTH_USER:
+                status = "authorized (user)";
+                st_con = ansi_highlight_green();
+                st_sym = special_glyph(BLACK_CIRCLE);
+                break;
+        case AUTH_KEY:
+                status = "authorized (key)";
+                st_con = ansi_highlight_green();
+                st_sym = special_glyph(BLACK_CIRCLE);
+                break;
+        default:
+                status = "unknown authorization";
+                st_con = ansi_highlight_red();
+                st_sym = special_glyph(BLACK_CIRCLE);
+                break;
         }
 
-        auth_coff = ansi_normal();
+        st_coff = ansi_normal();
 
-        printf("%s%s%s %s\n", auth_con, auth_sym, auth_coff, device->name);
+        printf("%s%s%s %s\n", st_con, st_sym, st_coff, device->name);
         printf("  %s vendor:     %s\n", special_glyph(TREE_BRANCH), device->vendor);
         printf("  %s uuid:       %s\n", special_glyph(TREE_BRANCH), device->uuid);
-        printf("  %s status:     %s\n", special_glyph(TREE_BRANCH), auth_level);
+        printf("  %s status:     %s\n", special_glyph(TREE_BRANCH), status);
 
-        if (authorized > 0) {
+        if (authorized > AUTH_MISSING) {
                 printf("  %s security:   ", special_glyph(TREE_BRANCH));
 
                 security = device_get_security_level(device->udev);
@@ -971,15 +984,15 @@ static const struct CtlCmd cmd_list = {
         .desc = "List thunderbolt devices",
 };
 
-static int tb_device_can_authorize(TbDevice *dev, Authorization *auth, unsigned level) {
+static int tb_device_can_authorize(TbDevice *dev, Authorization *auth, int level) {
         int r;
-        unsigned have;
+        int have;
         SecurityLevel can;
 
         r = device_get_authorized(dev->udev, &have);
         if (r < 0)
                 return r;
-        else if (have != AUTHORIZED_MISSING)
+        else if (have != AUTH_NEEDED)
                 return -EEXIST;
 
         can = device_get_security_level(dev->udev);
@@ -987,12 +1000,12 @@ static int tb_device_can_authorize(TbDevice *dev, Authorization *auth, unsigned 
                 return can;
         if (can != SECURITY_USER && can != SECURITY_SECURE)
                 return -EDOM;
-        if (level > (unsigned) can)
+        if (level > can)
                 return -ERANGE;
         if (level == 0)
                 level = can;
 
-        if (level == AUTHORIZED_KEY && auth->level != level)
+        if (level == AUTH_KEY && auth->level != level)
                 auth->key = tb_generate_key_string();
 
         auth->level = level;
@@ -1101,7 +1114,7 @@ static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
         if (r < 0 && r != -ENOENT) {
                 log_error_errno(r, "Failed to read authorization from store: %m");
                 return EXIT_FAILURE;
-        } else if (r == -ENOENT || auth.level == AUTHORIZED_MISSING) {
+        } else if (r == -ENOENT || auth.level == AUTH_NEEDED) {
                 /* Unknown or ignored device */
                 return EXIT_SUCCESS;
         }
