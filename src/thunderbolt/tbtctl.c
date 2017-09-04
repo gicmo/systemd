@@ -95,20 +95,20 @@ typedef enum {
         AUTH_KEY     = 2,
 } AuthLevel;
 
-typedef struct Authorization {
+typedef struct Auth {
         int level;
         char *key;
         KeyStore store;
-} Authorization;
-#define AUTHORIZATION_INITIALIZER {-1, NULL, -1}
+} Auth;
+#define AUTH_INITIALIZER {-1, NULL, -1}
 
-static void authorization_reset(Authorization *a) {
+static void auth_reset(Auth *a) {
         a->key = string_free_erase(a->key);
         a->level = AUTH_MISSING;
         a->store = 0;
 }
 
-#define _cleanup_authorization_reset_ _cleanup_(authorization_reset)
+#define _cleanup_auth_reset_ _cleanup_(auth_reset)
 
 typedef struct {
 
@@ -256,7 +256,7 @@ static int device_read_uuid_at(int dirfd, char **uuid_out) {
 }
 
 
-static int device_authorize_at(int dirfd, Authorization *auth) {
+static int device_authorize_at(int dirfd, Auth *auth) {
         char buf[FORMAT_SECURITY_MAX];
         _cleanup_close_ int fd = -1;
         ssize_t l;
@@ -356,7 +356,7 @@ static int tb_device_new_from_syspath(struct udev *udev, const char *path, TbDev
 
 }
 
-static int tb_device_authorize(TbDevice *dev, Authorization *auth) {
+static int tb_device_authorize(TbDevice *dev, Auth *auth) {
 
         assert(dev);
         assert(auth);
@@ -475,7 +475,7 @@ static int tb_store_device_load(const char *uuid, TbDevice **device) {
 }
 
 
-static int store_efivars_get_auth(const char *uuid, Authorization *ret) {
+static int store_efivars_get_auth(const char *uuid, Auth *ret) {
         _cleanup_free_ char *var = NULL;
         sd_id128_t id;
         size_t l;
@@ -508,7 +508,7 @@ static int store_efivars_get_auth(const char *uuid, Authorization *ret) {
         return -EIO;
 }
 
-static int store_get_authorization(TbStore *store, const char *uuid, Authorization *ret) {
+static int store_get_auth(TbStore *store, const char *uuid, Auth *ret) {
         _cleanup_free_ char *p = NULL;
         struct stat st;
         char *path;
@@ -517,7 +517,7 @@ static int store_get_authorization(TbStore *store, const char *uuid, Authorizati
         if (in_initrd())
                 return store_efivars_get_auth(uuid, ret);
 
-        path = strjoina(store->path, "/authorization/", uuid);
+        path = strjoina(store->path, "/auth/", uuid);
 
         r = lstat(path, &st);
         if (r < 0)
@@ -548,7 +548,7 @@ static int store_get_authorization(TbStore *store, const char *uuid, Authorizati
 
 static int store_efivars_put_auth(TbStore *store,
                                   const char *uuid,
-                                  Authorization *auth) {
+                                  Auth *auth) {
         _cleanup_free_ char *target = NULL;
         char buf[FORMAT_SECURITY_MAX];
         sd_id128_t id;
@@ -585,7 +585,7 @@ static int store_efivars_put_auth(TbStore *store,
 
 static int store_fsdb_put_auth(TbStore *store,
                                const char *uuid,
-                               Authorization *auth) {
+                               Auth *auth) {
 
         return -ENOTSUP;
 }
@@ -593,7 +593,7 @@ static int store_fsdb_put_auth(TbStore *store,
 
 static int store_put_device(TbStore *store,
                             TbDevice *device,
-                            Authorization *auth) {
+                            Auth *auth) {
         _cleanup_fclose_ FILE *f = NULL;
         const char *uuid;
         char *path;
@@ -694,7 +694,7 @@ static int tb_store_load_missing(TbStore *store, Hashmap *devices) {
         return 0;
 }
 
-static int tb_store_remove_authorization(TbStore *store, const char *uuid) {
+static int tb_store_remove_auth(TbStore *store, const char *uuid) {
         _cleanup_free_ char *p = NULL;
         struct stat st;
         char *path;
@@ -777,7 +777,7 @@ static int device_get_authorized(struct udev_device *device, int *authorized) {
 static void device_print(TbStore *store, TbDevice *device)
 {
         SecurityLevel security;
-        Authorization auth = AUTHORIZATION_INITIALIZER;
+        Auth auth = AUTH_INITIALIZER;
         const char *status;
         const char *st_sym, *st_con, *st_coff;
         const char *policy_str;
@@ -842,7 +842,7 @@ static void device_print(TbStore *store, TbDevice *device)
         if (!in_store)
                 goto out;
 
-        r = store_get_authorization(store, device->uuid, &auth);
+        r = store_get_auth(store, device->uuid, &auth);
         if (r < 0)
                 policy_str = "io error";
         else if (r == -ENOENT)
@@ -984,7 +984,7 @@ static const struct CtlCmd cmd_list = {
         .desc = "List thunderbolt devices",
 };
 
-static int tb_device_can_authorize(TbDevice *dev, Authorization *auth, int level) {
+static int tb_device_can_authorize(TbDevice *dev, Auth *auth, int level) {
         int r;
         int have;
         SecurityLevel can;
@@ -1014,7 +1014,7 @@ static int tb_device_can_authorize(TbDevice *dev, Authorization *auth, int level
 
 static int authorize_user(struct udev *udev, int argc, char *argv[]) {
         _cleanup_tb_device_free_ TbDevice *device = NULL;
-        _cleanup_authorization_reset_ Authorization auth = { 0, };
+        _cleanup_auth_reset_ Auth auth = { 0, };
         _cleanup_tb_store_free_ TbStore *store = NULL;
         bool store_put = true;
         int r;
@@ -1037,7 +1037,7 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        r = store_get_authorization(store, device->uuid, &auth);
+        r = store_get_auth(store, device->uuid, &auth);
         if (r == -ENOENT) {
                 store_put = true;
         } else if (r < 0) {
@@ -1089,7 +1089,7 @@ static const struct CtlCmd cmd_authorize = {
 static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
         _cleanup_tb_device_free_ TbDevice *device = NULL;
         _cleanup_tb_store_free_ TbStore *store = NULL;
-        _cleanup_authorization_reset_ Authorization auth = { 0, };
+        _cleanup_auth_reset_ Auth auth = { 0, };
         int r;
 
         if (argc < 2) {
@@ -1110,7 +1110,7 @@ static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        r = store_get_authorization(store, device->uuid, &auth);
+        r = store_get_auth(store, device->uuid, &auth);
         if (r < 0 && r != -ENOENT) {
                 log_error_errno(r, "Failed to read authorization from store: %m");
                 return EXIT_FAILURE;
@@ -1167,7 +1167,7 @@ static int forget_device(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        r = tb_store_remove_authorization(store, uuid);
+        r = tb_store_remove_auth(store, uuid);
         if (r < 0 && errno != -ENOENT) {
                 log_error_errno(r, "Could not remove authorization: %m");
                 return EXIT_FAILURE;
