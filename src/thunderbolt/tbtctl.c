@@ -81,10 +81,12 @@ static const char* const security_table[_SECURITY_MAX] = {
 };
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP(security, SecurityLevel);
 
-typedef enum KeyStore {
-        TB_KEYSTORE_EFIVARS,
-        TB_KEYSTORE_FSDB,
-} KeyStore;
+typedef enum Store {
+        STORE_NONE    = -1,
+        STORE_DEFAULT = 0,
+        STORE_EFIVARS,
+        STORE_FSDB,
+} Store;
 
 /* With the exception of MISSIING (-1) the following values
  * corresponds to sysfs 'authorized' value. */
@@ -95,10 +97,14 @@ typedef enum {
         AUTH_KEY     = 2,
 } AuthLevel;
 
+static bool auth_level_can_authorize(AuthLevel lv) {
+        return lv == AUTH_USER || lv == AUTH_KEY;
+}
+
 typedef struct Auth {
         int level;
         char *key;
-        KeyStore store;
+        Store store;
 } Auth;
 #define AUTH_INITIALIZER {-1, NULL, -1}
 
@@ -179,9 +185,9 @@ static int tb_device_compare(const void *ia, const void *ib) {
         return strcmp_ptr(pa, pb);
 }
 
-static int tb_device_ptr_compare (const void *pa, const void *pb) {
+static int tb_device_ptr_compare(const void *pa, const void *pb) {
         const TbDevice **a = (const TbDevice **) pa;
-        const TbDevice **b =  (const TbDevice **) pb;
+        const TbDevice **b = (const TbDevice **) pb;
 
         return tb_device_compare(*a, *b);
 }
@@ -259,13 +265,15 @@ static int device_read_uuid_at(int dirfd, char **uuid_out) {
 static int device_authorize_at(int dirfd, Auth *auth) {
         char buf[FORMAT_SECURITY_MAX];
         _cleanup_close_ int fd = -1;
+        AuthLevel lv;
         ssize_t l;
 
         if (auth->level != AUTH_USER && auth->level != AUTH_KEY)
                 return -EINVAL;
 
-         /* logging? */
-        if (auth->level == AUTH_KEY) {
+        lv = auth->level;
+
+        if (lv == AUTH_KEY) {
                 _cleanup_close_ int key_fd = -1;
 
                 if (auth->key == NULL)
@@ -282,13 +290,16 @@ static int device_authorize_at(int dirfd, Auth *auth) {
                 else if (l != KEY_CHARS)
                         return -EIO;
 
+                if (auth->store == STORE_NONE)
+                        lv = AUTH_USER;
+
         }
 
         fd = openat(dirfd, "authorized", O_WRONLY|O_CLOEXEC|O_WRONLY);
         if (fd < 0)
                 return -errno;
 
-        xsprintf(buf, "%hhu", (uint8_t) auth->level);
+        xsprintf(buf, "%hhu", (uint8_t) lv);
         l = write(fd, buf, 1);
 
         if (l < 0)
@@ -300,7 +311,7 @@ static int device_authorize_at(int dirfd, Auth *auth) {
 }
 
 
-static char * get_sysattr_name(struct udev_device *udev, const char *attr) {
+static char *get_sysattr_name(struct udev_device *udev, const char *attr) {
         char *s;
         const char *v;
 
@@ -346,14 +357,14 @@ static int tb_device_new_from_udev(struct udev_device *udev, TbDevice **ret) {
         return 0;
 }
 
-static int tb_device_new_from_syspath(struct udev *udev, const char *path, TbDevice **ret) {
+static int tb_device_new_from_syspath(struct udev *udev, const char *path, TbDevice **d) {
         _cleanup_udev_device_unref_ struct udev_device *udevice = NULL;
 
         udevice = udev_device_new_from_syspath(udev, path);
         if (udevice == NULL)
                 return -ENODEV;
-        return tb_device_new_from_udev(udevice, ret);
 
+        return tb_device_new_from_udev(udevice, d);
 }
 
 static int tb_device_authorize(TbDevice *dev, Auth *auth) {
@@ -368,13 +379,13 @@ static int tb_device_authorize(TbDevice *dev, Auth *auth) {
         return device_authorize_at(dirfd(dev->devdir), auth);
 }
 
-#define TB_STORE_PATH "/etc/thunderbolt/"
+#define TB_STORE_PATH "/etc/thunderbolt"
 
 typedef struct TbStore TbStore;
 
 struct TbStore {
         char *path;
-        KeyStore keystore;
+        Store store;
 };
 
 static void tb_store_free(TbStore *s) {
@@ -390,14 +401,20 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(TbStore*, tb_store_free);
 
 static int tb_store_new(TbStore **ret) {
         _cleanup_tb_store_free_ TbStore *s = NULL;
+        const char *val;
 
         s = new0(TbStore, 1);
         if (!s)
                 return -ENOMEM;
 
+        val = getenv("SYSTEMD_THUNDERBOLT_DB_PATH");
 
-        s->path = strdup(TB_STORE_PATH);
-        s->keystore = TB_KEYSTORE_EFIVARS;
+        if (val)
+                s->path = strdup(val);
+        else
+                s->path = strdup(TB_STORE_PATH);
+
+        s->store = STORE_EFIVARS;
 
         *ret = s;
         s = NULL;
@@ -492,7 +509,7 @@ static int store_efivars_get_auth(const char *uuid, Auth *ret) {
         if (r < 0)
                 return r;
 
-        ret->store = TB_KEYSTORE_EFIVARS;
+        ret->store = STORE_EFIVARS;
 
         l = strlen(var);
         if (l == 1) {
@@ -517,14 +534,19 @@ static int store_get_auth(TbStore *store, const char *uuid, Auth *ret) {
         if (in_initrd())
                 return store_efivars_get_auth(uuid, ret);
 
-        path = strjoina(store->path, "/auth/", uuid);
+        path = strjoina(store->path, "/authorization/", uuid);
 
         r = lstat(path, &st);
-        if (r < 0)
+        if (r < 0 && errno != ENOENT)
                 return -errno;
+        if (errno == ENOENT) {
+                ret->level = AUTH_MISSING;
+                return 0;
+        }
+
         if (S_ISREG(st.st_mode)) {
                 ret->level = AUTH_USER;
-                ret->store = TB_KEYSTORE_FSDB;
+                ret->store = STORE_FSDB;
                 return 0;
         }
 
@@ -535,7 +557,11 @@ static int store_get_auth(TbStore *store, const char *uuid, Auth *ret) {
         if (startswith(p, "/sys/firmware/efi/efivars")) {
                 r = store_efivars_get_auth(uuid, ret);
         } else if (startswith(p, store->path)) {
-                r = -ENOSYS;
+                r = -ENOTSUP;
+        } else {
+                r = -ENOTSUP;
+                ret->level = AUTH_MISSING;
+                ret->store = STORE_NONE;
         }
 
         return r;
@@ -601,14 +627,17 @@ static int store_put_device(TbStore *store,
 
         uuid = device->uuid;
 
-        switch (store->keystore) {
-        case TB_KEYSTORE_FSDB:
+        switch (store->store) {
+        case STORE_FSDB:
                 r = store_fsdb_put_auth(store, uuid, auth);
                 break;
 
-        case TB_KEYSTORE_EFIVARS:
+        case STORE_EFIVARS:
                 r = store_efivars_put_auth(store, uuid, auth);
                 break;
+
+        default:
+                r = -ENOTSUP;
         }
 
         if (r < 0)
@@ -748,7 +777,7 @@ static int tb_store_remove_device(TbStore *store, const char *uuid) {
         return 0;
 }
 
-static char * tb_generate_key_string(void) {
+static void auth_generate_key_string(Auth *a) {
         uint8_t rnddata[KEY_BYTES];
         char *keydata;
         int i;
@@ -759,7 +788,8 @@ static char * tb_generate_key_string(void) {
         for (i = 0; i < KEY_BYTES; i++)
                 snprintf(keydata + i*2, HEX_BYTES, "%02hhx", rnddata[i]);
 
-        return keydata;
+        a->key = keydata;
+        a->store = STORE_NONE;
 }
 
 static int device_get_authorized(struct udev_device *device, int *authorized) {
@@ -790,33 +820,26 @@ static void device_print(TbStore *store, TbDevice *device)
                 status = "unknown (error)";
                 st_con = ansi_highlight_red();
                 st_sym = special_glyph(BLACK_CIRCLE);
-        }
-        switch (authorized) {
-        case AUTH_MISSING:
+        } else if (authorized == AUTH_MISSING) {
                 status = "offline";
                 st_con = ansi_highlight_blue();;
                 st_sym = special_glyph(BLACK_CIRCLE);
-                break;
-        case AUTH_NEEDED:
+        } else if (authorized == AUTH_NEEDED) {
                 status = "unauthorized";
                 st_con = ansi_highlight_yellow();
                 st_sym = special_glyph(BLACK_CIRCLE);
-                break;
-        case AUTH_USER:
+        } else if (authorized == AUTH_USER) {
                 status = "authorized (user)";
                 st_con = ansi_highlight_green();
                 st_sym = special_glyph(BLACK_CIRCLE);
-                break;
-        case AUTH_KEY:
+        } else if (authorized ==  AUTH_KEY) {
                 status = "authorized (key)";
                 st_con = ansi_highlight_green();
                 st_sym = special_glyph(BLACK_CIRCLE);
-                break;
-        default:
+        } else {
                 status = "unknown authorization";
                 st_con = ansi_highlight_red();
                 st_sym = special_glyph(BLACK_CIRCLE);
-                break;
         }
 
         st_coff = ansi_normal();
@@ -844,11 +867,13 @@ static void device_print(TbStore *store, TbDevice *device)
 
         r = store_get_auth(store, device->uuid, &auth);
         if (r < 0)
-                policy_str = "io error";
-        else if (r == -ENOENT)
+                policy_str = "error";
+        else if (!auth_level_can_authorize(auth.level))
                 policy_str = "ignore";
-        else
-                policy_str = "authorize";
+        else if (auth.level == AUTH_USER)
+                policy_str = "authorize (user)";
+        else if (auth.level == AUTH_KEY)
+                policy_str = "authorize (key)";
 
         printf("     %s policy:  %s\n", special_glyph(TREE_BRANCH), policy_str);
         printf("     %s key:     %s\n", special_glyph(TREE_RIGHT), yes_no(!!auth.key));
@@ -984,39 +1009,12 @@ static const struct CtlCmd cmd_list = {
         .desc = "List thunderbolt devices",
 };
 
-static int tb_device_can_authorize(TbDevice *dev, Auth *auth, int level) {
-        int r;
-        int have;
-        SecurityLevel can;
-
-        r = device_get_authorized(dev->udev, &have);
-        if (r < 0)
-                return r;
-        else if (have != AUTH_NEEDED)
-                return -EEXIST;
-
-        can = device_get_security_level(dev->udev);
-        if (can < 0)
-                return can;
-        if (can != SECURITY_USER && can != SECURITY_SECURE)
-                return -EDOM;
-        if (level > can)
-                return -ERANGE;
-        if (level == 0)
-                level = can;
-
-        if (level == AUTH_KEY && auth->level != level)
-                auth->key = tb_generate_key_string();
-
-        auth->level = level;
-        return 0;
-}
-
 static int authorize_user(struct udev *udev, int argc, char *argv[]) {
         _cleanup_tb_device_free_ TbDevice *device = NULL;
         _cleanup_auth_reset_ Auth auth = { 0, };
         _cleanup_tb_store_free_ TbStore *store = NULL;
-        bool store_put = true;
+        SecurityLevel sl;
+        int authorized;
         int r;
 
         if (argc < 2) {
@@ -1037,28 +1035,38 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
+        r = device_get_authorized(device->udev, &authorized);
+        if (r < 0) {
+                log_error_errno(r, "Failed to get current authorization: %m");
+                return EXIT_FAILURE;
+        }
+        if (authorized != AUTH_NEEDED) {
+                log_error("Device already authorized");
+                return EXIT_FAILURE;
+        }
+
+        sl = device_get_security_level(device->udev);
+        if (sl < 0) {
+                log_error_errno(r, "Failed to get host controller security level");
+                return EXIT_FAILURE;
+        }
+        if (sl != SECURITY_USER && sl != SECURITY_SECURE) {
+                log_error("Security level of controller insufficient");
+                return EXIT_FAILURE;
+        }
+
         r = store_get_auth(store, device->uuid, &auth);
-        if (r == -ENOENT) {
-                store_put = true;
-        } else if (r < 0) {
+        if (r < 0) {
                 log_error_errno(r, "Failed to read authorization from store: %m");
                 return EXIT_FAILURE;
         }
 
-        r = tb_device_can_authorize(device, &auth, 0);
-        if (r == -EEXIST) {
-                log_error("Device already authorized");
-                return EXIT_FAILURE;
-        } else if (r == -EDOM) {
-                log_error("Security level of controller insufficient");
-                return EXIT_FAILURE;
-        } else if (r == -ERANGE) {
-                log_error("Requested security level too high");
-                return EXIT_FAILURE;
-        } else if (r < 0) {
-                log_error_errno(r, "Failed to get device security level: %m");
-                return EXIT_FAILURE;
+        if (auth.level == AUTH_MISSING) {
+                auth.level = sl;
+                auth.store = STORE_NONE;
         }
+        if (auth.level == AUTH_KEY && auth.key == NULL)
+                auth_generate_key_string(&auth);
 
         r = tb_device_authorize(device, &auth);
         if (r < 0) {
@@ -1066,7 +1074,7 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        if (!store_put)
+        if (auth.store != STORE_NONE)
                 return EXIT_SUCCESS;
 
         r = store_put_device(store, device, &auth);
@@ -1074,7 +1082,6 @@ static int authorize_user(struct udev *udev, int argc, char *argv[]) {
                 log_error_errno(r, "Failed to commit device to store: %m");
                 return EXIT_FAILURE;
         }
-
 
         return EXIT_SUCCESS;
 }
@@ -1089,7 +1096,8 @@ static const struct CtlCmd cmd_authorize = {
 static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
         _cleanup_tb_device_free_ TbDevice *device = NULL;
         _cleanup_tb_store_free_ TbStore *store = NULL;
-        _cleanup_auth_reset_ Auth auth = { 0, };
+        _cleanup_auth_reset_ Auth auth = AUTH_INITIALIZER;
+        SecurityLevel sl;
         int r;
 
         if (argc < 2) {
@@ -1111,25 +1119,29 @@ static int authorize_udev(struct udev *udev, int argc, char *argv[]) {
         }
 
         r = store_get_auth(store, device->uuid, &auth);
-        if (r < 0 && r != -ENOENT) {
-                log_error_errno(r, "Failed to read authorization from store: %m");
+        if (r < 0) {
+                log_error_errno(r, "Failed to load authorization: %m");
                 return EXIT_FAILURE;
-        } else if (r == -ENOENT || auth.level == AUTH_NEEDED) {
+        }
+
+        if (auth.level == AUTH_MISSING || auth.level == AUTH_NEEDED) {
                 /* Unknown or ignored device */
                 return EXIT_SUCCESS;
         }
 
-        r = tb_device_can_authorize(device, &auth, 0);
-        if (r == -EEXIST) {
-                log_error("Device already authorized");
-                return EXIT_FAILURE;
-        } else if (r == -EDOM) {
-                log_debug("Security level of controller insufficient");
-                return EXIT_SUCCESS; /* not an error */
-        } else if (r < 0) {
-                log_error_errno(r, "Failed to get device security level: %m");
+        sl = device_get_security_level(device->udev);
+        if (sl < 0) {
+                log_error_errno(sl, "Failed to determine security level");
                 return EXIT_FAILURE;
         }
+
+        if (sl != SECURITY_USER && sl != SECURITY_SECURE) {
+                log_debug("Security level of controller insufficient");
+                /* not an error here */
+                return EXIT_SUCCESS;
+        }
+
+        auth.level = MIN(auth.level, sl);
 
         r = tb_device_authorize(device, &auth);
         if (r < 0) {
