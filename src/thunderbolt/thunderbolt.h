@@ -19,6 +19,7 @@
   along with systemd; If not, see <http://www.gnu.org/licenses/>.
 ***/
 
+#include <assert.h>
 #include <dirent.h>
 #include <stdbool.h>
 #include <sys/types.h>
@@ -86,6 +87,28 @@ int tb_device_compare(const void *ia, const void *ib);
 SecurityLevel tb_device_get_security_level(TbDevice *device);
 bool tb_device_is_online(TbDevice *dev);
 
+typedef struct {
+        unsigned n;
+        unsigned a;
+
+        TbDevice **devices;
+} TbDeviceVec;
+
+void tb_device_vec_free(TbDeviceVec **v);
+#define _cleanup_tb_device_vec_free_ _cleanup_(tb_device_vec_free)
+
+TbDeviceVec *tb_device_vec_ensure_allocated(TbDeviceVec **v);
+TbDevice *tb_device_vec_at(TbDeviceVec *v, unsigned i);
+bool tb_device_vec_contains_uuid(TbDeviceVec *v, const char *uuid);
+void tb_device_vec_push_back(TbDeviceVec *v, TbDevice *d);
+void tb_device_vec_sort(TbDeviceVec *v);
+
+inline TbDevice *tb_device_vec_at(TbDeviceVec *v, unsigned i) {
+        assert(v);
+        assert(i < v->n);
+
+        return v->devices[i];
+}
 
 /* Store related functions */
 #define TB_STORE_PATH "/etc/thunderbolt"
@@ -103,6 +126,7 @@ int tb_store_new(TbStore **ret);
 int tb_store_list_ids(TbStore *store, char ***ret);
 bool tb_store_have_device(TbStore *store, const char *uuid);
 int tb_store_device_load(TbStore *store, const char *uuid, TbDevice **device);
+int tb_store_load_missing(TbStore *store, TbDeviceVec **devices);
 int store_get_auth(TbStore *store, const char *uuid, Auth *ret);
 int tb_store_remove_auth(TbStore *store, const char *uuid);
 int tb_store_remove_device(TbStore *store, const char *uuid);

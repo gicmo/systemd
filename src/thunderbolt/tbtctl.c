@@ -348,10 +348,79 @@ bool tb_device_is_online(TbDevice *dev) {
         return dev->udev != NULL;
 }
 
+
+void tb_device_vec_free(TbDeviceVec **vec) {
+        TbDeviceVec *v;
+
+        if (!vec || !*vec)
+                return;
+
+        v = *vec;
+
+        free(v->devices);
+        free(v);
+
+        *vec = NULL;
+}
+
+TbDeviceVec *tb_device_vec_ensure_allocated(TbDeviceVec **vec) {
+        TbDeviceVec *v;
+
+        assert(vec);
+        if (*vec != NULL)
+                return *vec;
+
+        v = *vec = new(TbDeviceVec, 1);
+
+        v->n = 0;
+        v->a = 2;
+        v->devices = new0(TbDevice *, v->a);
+
+        return v;
+};
+
+bool tb_device_vec_contains_uuid(TbDeviceVec *v, const char *uuid) {
+        unsigned i;
+
+        assert(v);
+        assert(uuid);
+
+        for (i = 0; i < v->n; i++) {
+                TbDevice *d = tb_device_vec_at(v, i);
+                if (streq(d->uuid, uuid))
+                        return true;
+        }
+
+        return false;
+}
+
+void tb_device_vec_push_back(TbDeviceVec *v, TbDevice *d) {
+        unsigned n = v->n + 1;
+        assert(n != 0);
+
+        if (n == v->a) {
+                unsigned a = v->a * 2;
+                assert(a > v->a);
+                v->devices = realloc_multiply(v->devices, sizeof(TbDevice *), a);
+                v->a = a;
+        }
+        v->devices[v->n] = d;
+        v->n = n;
+}
+
+void tb_device_vec_sort(TbDeviceVec *v) {
+        if (v == NULL)
+                return;
+
+        qsort(v->devices, v->n,
+              sizeof(TbDevice *),
+              tb_device_ptr_compare);
+}
+
 void tb_store_free(TbStore **store) {
         TbStore *s;
 
-        if (!store)
+        if (!store || !*store)
                 return;
 
         s = *store;
@@ -661,19 +730,24 @@ int tb_store_list_ids(TbStore *store, char ***ret) {
         return 0;
 }
 
-static int tb_store_load_missing(TbStore *store, Hashmap *devices) {
+int tb_store_load_missing(TbStore *store, TbDeviceVec **devices) {
+        TbDeviceVec *v;
+        TbDevice *device;
         char **ids = NULL;
         char **i;
-        TbDevice *device;
-
         int r;
+
+        v = tb_device_vec_ensure_allocated(devices);
+        if (v == NULL)
+                return -ENOMEM;
+
         r = tb_store_list_ids(store, &ids);
         if (r < 0)
                 return r;
 
         STRV_FOREACH(i, ids) {
                 const char *id = *i;
-                if (hashmap_contains(devices, id))
+                if (tb_device_vec_contains_uuid(v, id))
                         continue;
 
                 r = tb_store_device_load(store, id, &device);
@@ -682,7 +756,7 @@ static int tb_store_load_missing(TbStore *store, Hashmap *devices) {
                         continue;
                 }
 
-                hashmap_put(devices, device->uuid, device);
+                tb_device_vec_push_back(v, device);
         }
 
         return 0;
@@ -752,7 +826,7 @@ static void device_print(TbStore *store, TbDevice *device)
         int r;
         bool in_store;
 
-        if (device->authorized == AUTH_MISSING) {
+        if (!tb_device_is_online(device)) {
                 status = "offline";
                 st_con = ansi_highlight_blue();;
                 st_sym = special_glyph(BLACK_CIRCLE);
@@ -814,14 +888,15 @@ static void device_print(TbStore *store, TbDevice *device)
         printf("\n");
 }
 
-static int list_devices_udev(struct udev *udev, Hashmap **ret) {
+static int list_devices_udev(struct udev *udev, TbDeviceVec **vec) {
         _cleanup_udev_enumerate_unref_ struct udev_enumerate *enumerate = NULL;
         struct udev_list_entry *list_entry = NULL, *first = NULL;
+        TbDeviceVec *v;
         int r;
 
-        r = hashmap_ensure_allocated(ret, &string_hash_ops);
-        if (r < 0)
-                return r;
+        v = tb_device_vec_ensure_allocated(vec);
+        if (v == NULL)
+                return -ENOMEM;
 
         enumerate = udev_enumerate_new(udev);
         if (enumerate == NULL)
@@ -849,37 +924,17 @@ static int list_devices_udev(struct udev *udev, Hashmap **ret) {
                 if (r < 0)
                         continue;
 
-                hashmap_put(*ret, device->uuid, device);
+                tb_device_vec_push_back(v, device);
         }
 
         return 0;
 }
 
-static TbDevice **devices_to_sorted_array(Hashmap *devices, unsigned *size) {
-        TbDevice **dl = NULL;
-        TbDevice *device;
-        TbDevice **i;
-        Iterator iter;
-        unsigned n;
-
-        n = hashmap_size(devices);
-        dl = i = new(TbDevice *, n);
-
-        HASHMAP_FOREACH(device, devices, iter)
-                *i++ = device;
-
-        qsort(dl, n, sizeof(TbDevice *), tb_device_ptr_compare);
-        *size = n;
-
-        return dl;
-}
-
 static int list_devices(struct udev *udev, int argc, char *argv[]) {
-        _cleanup_hashmap_free_ Hashmap *devices = NULL;
+        _cleanup_tb_device_vec_free_ TbDeviceVec *devices = NULL;
         _cleanup_tb_store_free_ TbStore *store = NULL;
-        _cleanup_free_ TbDevice **dl = NULL;
         TbDevice *device = NULL;
-        unsigned i, n;
+        unsigned i;
         int c, r;
         bool show_all = false;
 
@@ -915,19 +970,15 @@ static int list_devices(struct udev *udev, int argc, char *argv[]) {
         }
 
         if (show_all) {
-                r = tb_store_load_missing(store, devices);
+                r = tb_store_load_missing(store, &devices);
                 if (r < 0)
                         log_error_errno(r, "Could not load devices from DB: %m");
         }
 
-        dl = devices_to_sorted_array(devices, &n);
-        if (dl == NULL) {
-                log_oom();
-                return EXIT_FAILURE;
-        }
+        tb_device_vec_sort(devices);
 
-        for (i = 0; i < n; i++) {
-                device = dl[i];
+        for (i = 0; i < devices->n; i++) {
+                device = tb_device_vec_at(devices, i);
                 device_print(store, device);
                 tb_device_free(&device);
         }
