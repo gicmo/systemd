@@ -53,9 +53,74 @@ struct CtlCmd {
         bool        root;
 };
 
+static inline void print_json_kv(const char *key, const char *value, bool more) {
+        printf("\"%s\": \"%s\"%s\n", key, value, more ? "," : "");
+}
 
-static void device_print(TbStore *store, TbDevice *device)
-{
+static inline void print_json_kb(const char *key, bool value, bool more) {
+        printf("\"%s\": %s%s\n", key, true_false(value), more ? "," : "");
+}
+
+
+static void device_print_json(TbStore *store, TbDevice *device, bool more) {
+        bool in_store;
+
+        printf("{\n");
+        print_json_kv("uuid", device->uuid, true);
+        print_json_kv("name", device->name, true);
+        print_json_kv("vendor", device->vendor, true);
+
+        if (!tb_device_is_online(device)) {
+                print_json_kv("status", "offline", true);
+        } else if (device->authorized == AUTH_NEEDED) {
+                print_json_kv("status", "unauthorized", true);
+                print_json_kb("authorized", false, true);
+        } else if (device->authorized == AUTH_USER) {
+                print_json_kv("status", "authorized (user)", true);
+                print_json_kb("authorized", true, true);
+                print_json_kv("auth-method", "user", true);
+        } else if (device->authorized ==  AUTH_KEY) {
+                print_json_kv("status", "authorized (key)", true);
+                print_json_kb("authorized", true, true);
+                print_json_kv("auth-method", "key", true);
+        } else {
+                print_json_kv("status", "unknown", true);
+        }
+
+        if (tb_device_is_online(device)) {
+                SecurityLevel s = tb_device_get_security_level(device);
+                const char *str;
+                 if (s == _SECURITY_INVALID)
+                         str = "unknown\n";
+                 else
+                         str = security_to_string(s);
+                print_json_kv("security", str, true);
+        }
+
+        in_store = tb_store_have_device(store, device->uuid);
+        print_json_kb("stored", in_store, in_store);
+        if (in_store) {
+                Auth auth = AUTH_INITIALIZER;
+                int r;
+
+                r = store_get_auth(store, device->uuid, &auth);
+                if (r < 0) {
+                        print_json_kv("policy", "error", false);
+                } else if (!auth_level_can_authorize(auth.level)) {
+                        print_json_kv("policy", "ignore", false);
+                } else if (auth.level == AUTH_USER) {
+                        print_json_kv("policy", "authorize", true);
+                        print_json_kv("policy-method", "user", false);
+                } else if (auth.level == AUTH_KEY) {
+                        print_json_kv("policy", "authorize", true);
+                        print_json_kv("policy-method", "key", false);
+                }
+        }
+
+        printf("}%s", more ? "," : "");
+}
+
+static void device_print(TbStore *store, TbDevice *device) {
         SecurityLevel security;
         Auth auth = AUTH_INITIALIZER;
         const char *status;
@@ -173,9 +238,11 @@ static int list_devices(struct udev *udev, int argc, char *argv[]) {
         unsigned i;
         int c, r;
         bool show_all = false;
+        bool json = false;
 
         static const struct option options[] = {
                 { "all",    no_argument, NULL, 'a' },
+                { "json",   no_argument, NULL, 'J' },
                 {}
 
         };
@@ -184,6 +251,9 @@ static int list_devices(struct udev *udev, int argc, char *argv[]) {
                 switch (c) {
                 case 'a':
                         show_all = true;
+                        break;
+                case 'J':
+                        json = true;
                         break;
                 case 'h':
                         fprintf(stderr, "FIXME: need help\n");
@@ -213,11 +283,21 @@ static int list_devices(struct udev *udev, int argc, char *argv[]) {
 
         tb_device_vec_sort(devices);
 
+        if (json)
+                printf("[");
+
         for (i = 0; i < devices->n; i++) {
                 device = tb_device_vec_at(devices, i);
-                device_print(store, device);
+                if (json)
+                        device_print_json(store, device, i != (devices->n - 1));
+                else
+                        device_print(store, device);
+
                 tb_device_free(&device);
         }
+
+        if (json)
+                printf("]\n");
 
         return EXIT_SUCCESS;
 }
