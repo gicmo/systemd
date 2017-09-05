@@ -53,7 +53,22 @@ int tb_store_new(TbStore **ret) {
         else
                 s->path = strdup(TB_STORE_PATH);
 
-        s->store = STORE_EFIVARS;
+        val = getenv("SYSTEMD_THUNDERBOLT_DB_STORE");
+        if (val) {
+                if (streq(val, "efivars")) {
+                        s->store = STORE_EFIVARS;
+                        if (!is_efi_boot())
+                                return -ENOTSUP;
+                } else if (streq(val, "fsdb")) {
+                        s->store = STORE_FSDB;
+                } else {
+                        return -ENOTSUP;
+                }
+        } else if (is_efi_boot()) {
+                s->store = STORE_EFIVARS;
+        } else {
+                s->store = STORE_FSDB;
+        }
 
         *ret = s;
         s = NULL;
