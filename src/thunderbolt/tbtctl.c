@@ -148,9 +148,7 @@ static int list_devices_udev(struct udev *udev, TbDeviceVec **vec) {
         if (r < 0)
                 return r;
 
-        r = udev_enumerate_scan_devices(enumerate);
-        if (r < 0)
-                return r;
+        udev_enumerate_scan_devices(enumerate);
 
         first = udev_enumerate_get_list_entry(enumerate);
         udev_list_entry_foreach(list_entry, first) {
