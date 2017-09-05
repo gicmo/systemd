@@ -289,7 +289,7 @@ static int list_devices(struct udev *udev, int argc, char *argv[]) {
         for (i = 0; i < devices->n; i++) {
                 device = tb_device_vec_at(devices, i);
                 if (json)
-                        device_print_json(store, device, i != (devices->n - 1));
+                        device_print_json(store, device, i + 1 < devices->n);
                 else
                         device_print(store, device);
 
@@ -310,7 +310,7 @@ static const struct CtlCmd cmd_list = {
 
 static int authorize_user(struct udev *udev, int argc, char *argv[]) {
         _cleanup_tb_device_free_ TbDevice *device = NULL;
-        _cleanup_auth_reset_ Auth auth = { 0, };
+        _cleanup_auth_reset_ Auth auth = AUTH_INITIALIZER;
         _cleanup_tb_store_free_ TbStore *store = NULL;
         SecurityLevel sl;
         int r;
@@ -523,16 +523,19 @@ static void help(void) {
 }
 
 
-#define ARG_VERSION 0x100
+#define ARG_VERSION  0x100
+#define ARG_NOROOT   0x101
 
 int main(int argc, char *argv[]) {
         _cleanup_udev_unref_ struct udev *udev = NULL;
         const char *cmdname;
         const struct CtlCmd *cmd;
+        bool root_check = true;
         static const struct option options[] = {
                 { "debug",   no_argument, NULL, 'd' },
                 { "help",    no_argument, NULL, 'h' },
                 { "version", no_argument, NULL, ARG_VERSION },
+                { "noroot",  no_argument, NULL, ARG_NOROOT  },
                 {}
         };
         unsigned int i;
@@ -555,7 +558,11 @@ int main(int argc, char *argv[]) {
 
                 case ARG_VERSION:
                         version();
-                        return EXIT_SUCCESS;;
+                        return EXIT_SUCCESS;
+
+                case ARG_NOROOT:
+                        root_check = false;
+                        break;
 
                 default:
                         assert_not_reached("Unhandled option");
@@ -585,7 +592,7 @@ int main(int argc, char *argv[]) {
                 return EXIT_FAILURE;
         }
 
-        if (cmd->root && geteuid() != 0) {
+        if (root_check && cmd->root && geteuid() != 0) {
                 fprintf(stderr, "%s %s must be invoked as root.\n",
                 program_invocation_short_name, cmdname);
                 return EXIT_FAILURE;
