@@ -311,7 +311,7 @@ int store_put_device(TbStore *store, TbDevice *device, Auth *auth) {
                 return r;
 
         path = strjoina(store->path, "/devices/", uuid);
-        r = mkdir_parents(path, 0644);
+        r = mkdir_parents(path, 0755);
         if (r < 0)
                 return r;
 
