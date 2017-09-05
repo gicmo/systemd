@@ -185,9 +185,24 @@ int store_get_auth(TbStore *store, const char *uuid, Auth *ret) {
         if (r < 0)
                 return -errno;
         if (S_ISREG(st.st_mode)) {
-                ret->level = AUTH_USER;
+                _cleanup_free_ char *l = NULL;
+
+                r = read_one_line_file(path, &l);
+                if (r < 0)
+                        return r;
+
                 ret->store = STORE_FSDB;
-                return 0;
+                if (strlen(l) == KEY_CHARS) {
+                        ret->level = AUTH_KEY;
+                        ret->key = l;
+                        l = NULL;
+                } else {
+                        ret->key = NULL;
+                        r = safe_atoi(l, &ret->level);
+                }
+                return r;
+        } else if (!S_ISLNK(st.st_mode)) {
+                return -ENOTSUP;
         }
 
         r = readlink_malloc(path, &p);
@@ -197,8 +212,6 @@ int store_get_auth(TbStore *store, const char *uuid, Auth *ret) {
         r = -ENOTSUP;
         if (startswith(p, "/sys/firmware/efi/efivars")) {
                 r = store_efivars_get_auth(uuid, ret);
-        } else if (startswith(p, store->path)) {
-                r = -ENOTSUP;
         }
 
         if (r == -ENOTSUP) {
@@ -254,8 +267,22 @@ static int store_efivars_put_auth(TbStore *store,
 static int store_fsdb_put_auth(TbStore *store,
                                const char *uuid,
                                Auth *auth) {
+        char buf[KEY_CHARS + 1];
+        char *path;
+        int r;
 
-        return -ENOTSUP;
+        if (auth->level == AUTH_KEY) {
+                xsprintf(buf, "%s", auth->key);
+        } else {
+                xsprintf(buf, "%hhu", (uint8_t) auth->level);
+        }
+
+        path = strjoina(store->path, "/authorization/", uuid);
+        r = mkdir_parents(path, 0755);
+        if (r < 0)
+                return r;
+
+        return write_string_file(path, buf, WRITE_STRING_FILE_CREATE);
 }
 
 
